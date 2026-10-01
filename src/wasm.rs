@@ -31,9 +31,9 @@
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, ExportKind, ExportSection, Function, FunctionSection,
-    GlobalSection, GlobalType, ImportSection, Instruction as Ins, MemArg, MemorySection,
-    MemoryType, Module, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function,
+    FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction as Ins, MemArg,
+    MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
 use crate::ast::*;
@@ -64,13 +64,14 @@ enum Ty {
     Num,
     Bool,
     Arr,
+    Str,
 }
 
 impl Ty {
     fn val(self) -> ValType {
         match self {
             Ty::Num => ValType::F64,
-            Ty::Bool | Ty::Arr => ValType::I32,
+            Ty::Bool | Ty::Arr | Ty::Str => ValType::I32,
         }
     }
 
@@ -205,9 +206,9 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
         }
     }
 
-    // The log imports: log1..logN, one per console.log arity used.
-    // Function index space: log1..logN are 0..N-1, $alloc is N, user
-    // functions follow, $run last.
+    // The log imports: log1..logN (numeric), then logstr. Function
+    // index space: log1..logN are 0..N-1, logstr is N, $allocb is N+1,
+    // $alloc is N+2, $concat is N+3, user functions follow, $run last.
     let all_stmts: Vec<&Stmt> = items
         .iter()
         .filter_map(|item| match item {
@@ -221,14 +222,49 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
         max_log = max_log.max(max_log_args(&stmts));
     }
 
-    let alloc_idx: u32 = max_log as u32;
+    let logstr_idx: u32 = max_log as u32;
+    let allocb_idx: u32 = logstr_idx + 1;
+    let alloc_idx: u32 = allocb_idx + 1;
+    let concat_idx: u32 = alloc_idx + 1;
     let mut signatures: HashMap<String, (u32, usize)> = HashMap::new();
     for (i, def) in user_fns.iter().enumerate() {
         signatures.insert(
             def.name.clone(),
-            (alloc_idx + 1 + i as u32, def.params.len()),
+            (concat_idx + 1 + i as u32, def.params.len()),
         );
     }
+
+    // Static string literals: collected up front so every `I32Const`
+    // reference is stable. Layout per literal: i32 byte length at +0,
+    // UTF-8 bytes at +8 (the same shape arrays use).
+    const DATA_BASE: usize = 1024;
+    let mut strings: HashMap<String, usize> = HashMap::new();
+    let mut data_blob: Vec<(usize, Vec<u8>)> = Vec::new();
+    {
+        let mut next = DATA_BASE;
+        let mut lits: Vec<String> = Vec::new();
+        for item in &*items {
+            collect_str_literals(item, &mut lits);
+        }
+        for lit in lits {
+            if strings.contains_key(&lit) {
+                continue;
+            }
+            strings.insert(lit.clone(), next);
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&(lit.len() as u32).to_le_bytes());
+            blob.extend_from_slice(&[0, 0, 0, 0]);
+            blob.extend_from_slice(lit.as_bytes());
+            data_blob.push((next, blob));
+            next += 8 + lit.len();
+        }
+    }
+    let data_end = data_blob
+        .iter()
+        .map(|(addr, blob)| addr + blob.len())
+        .max()
+        .unwrap_or(DATA_BASE);
+    let arena_start = (data_end + 7) & !7;
 
     let mut types = TypeSection::new();
     let mut type_ids: HashMap<(Vec<ValType>, Vec<ValType>), u32> = HashMap::new();
@@ -252,32 +288,38 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
         let params = vec![ValType::F64; k];
         log_types.push(ty(&mut types, &mut type_ids, params, vec![]));
     }
+    let logstr_ty = ty(&mut types, &mut type_ids, vec![ValType::I32], vec![]);
+    let allocb_ty = ty(
+        &mut types,
+        &mut type_ids,
+        vec![ValType::I32],
+        vec![ValType::I32],
+    );
     let alloc_ty = ty(
         &mut types,
         &mut type_ids,
         vec![ValType::I32],
         vec![ValType::I32],
     );
+    let concat_ty = ty(
+        &mut types,
+        &mut type_ids,
+        vec![ValType::I32, ValType::I32],
+        vec![ValType::I32],
+    );
 
     let mut functions = FunctionSection::new();
     let mut code = CodeSection::new();
 
-    // $alloc(len: i32) -> i32: bump-allocate an array (header + elems),
-    // growing memory as needed.
-    let mut alloc_fn = Function::new(vec![(2, ValType::I32)]); // 0: len, 1: bytes, 2: grow result
+    // $allocb(bytes: i32) -> i32: raw bump allocation, growing memory
+    // as needed. The workhorse under both arrays and strings.
+    let mut allocb_fn = Function::new(vec![(2, ValType::I32)]); // 0: bytes, 1: grow result
     for ins in [
-        // bytes = 8 + len * 8
-        Ins::LocalGet(0),
-        Ins::I32Const(8),
-        Ins::I32Mul,
-        Ins::I32Const(8),
-        Ins::I32Add,
-        Ins::LocalSet(1),
         Ins::Block(BlockType::Empty),
         Ins::Loop(BlockType::Empty),
         // fits? (arena + bytes <= memory.size * 65536)
         Ins::GlobalGet(0),
-        Ins::LocalGet(1),
+        Ins::LocalGet(0),
         Ins::I32Add,
         Ins::MemorySize(0),
         Ins::I32Const(16),
@@ -295,20 +337,39 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
         Ins::Br(0),
         Ins::End,
         Ins::End,
-        // header: length at ptr + 0
+        // result = old arena; arena += bytes
         Ins::GlobalGet(0),
+        Ins::GlobalGet(0),
+        Ins::LocalGet(0),
+        Ins::I32Add,
+        Ins::GlobalSet(0),
+        Ins::End, // function body terminator
+    ] {
+        allocb_fn.instruction(&ins);
+    }
+    functions.function(allocb_ty);
+    code.function(&allocb_fn);
+
+    // $alloc(len: i32) -> i32: element arrays (i32 length header at
+    // +0, f64 elements at +8).
+    let mut alloc_fn = Function::new(vec![(1, ValType::I32), (1, ValType::I32)]); // 0: len, 1: ptr
+    for ins in [
+        Ins::LocalGet(0),
+        Ins::I32Const(8),
+        Ins::I32Mul,
+        Ins::I32Const(8),
+        Ins::I32Add,
+        Ins::Call(allocb_idx),
+        Ins::LocalSet(1),
+        // header: length at ptr + 0
+        Ins::LocalGet(1),
         Ins::LocalGet(0),
         Ins::I32Store(MemArg {
             offset: 0,
             align: 2,
             memory_index: 0,
         }),
-        // result = old arena; arena += bytes
-        Ins::GlobalGet(0),
-        Ins::GlobalGet(0),
         Ins::LocalGet(1),
-        Ins::I32Add,
-        Ins::GlobalSet(0),
         Ins::End, // function body terminator
     ] {
         alloc_fn.instruction(&ins);
@@ -316,10 +377,87 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
     functions.function(alloc_ty);
     code.function(&alloc_fn);
 
+    // $concat(a: i32, b: i32) -> i32: a fresh arena string holding the
+    // UTF-8 bytes of both inputs.
+    let mut concat_fn = Function::new(vec![(5, ValType::I32)]); // a, b, la, lb, ptr
+    for ins in [
+        Ins::LocalGet(0),
+        Ins::I32Load(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }),
+        Ins::LocalSet(2),
+        Ins::LocalGet(1),
+        Ins::I32Load(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }),
+        Ins::LocalSet(3),
+        // ptr = $allocb(8 + la + lb)
+        Ins::LocalGet(2),
+        Ins::LocalGet(3),
+        Ins::I32Add,
+        Ins::I32Const(8),
+        Ins::I32Add,
+        Ins::Call(allocb_idx),
+        Ins::LocalSet(4),
+        // header: total byte length
+        Ins::LocalGet(4),
+        Ins::LocalGet(2),
+        Ins::LocalGet(3),
+        Ins::I32Add,
+        Ins::I32Store(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }),
+        // memory.copy(dst = ptr + 8, src = a + 8, size = la)
+        Ins::LocalGet(4),
+        Ins::I32Const(8),
+        Ins::I32Add,
+        Ins::LocalGet(0),
+        Ins::I32Const(8),
+        Ins::I32Add,
+        Ins::LocalGet(2),
+        Ins::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        },
+        // memory.copy(dst = ptr + 8 + la, src = b + 8, size = lb)
+        Ins::LocalGet(4),
+        Ins::I32Const(8),
+        Ins::I32Add,
+        Ins::LocalGet(2),
+        Ins::I32Add,
+        Ins::LocalGet(1),
+        Ins::I32Const(8),
+        Ins::I32Add,
+        Ins::LocalGet(3),
+        Ins::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        },
+        Ins::LocalGet(4),
+        Ins::End, // function body terminator
+    ] {
+        concat_fn.instruction(&ins);
+    }
+    functions.function(concat_ty);
+    code.function(&concat_fn);
+
     // User functions.
-    let mut fn_count = alloc_idx + 1;
+    let mut fn_count = concat_idx + 1;
     for def in &user_fns {
-        let mut c = FnCompiler::new(&def.params, &signatures, alloc_idx);
+        let mut c = FnCompiler::new(
+            &def.params,
+            &signatures,
+            alloc_idx,
+            concat_idx,
+            logstr_idx,
+            &strings,
+        );
         c.compile_stmts(&def.body.iter().collect::<Vec<_>>())?;
         // Safety net for paths that fall off the end.
         c.emit(Ins::F64Const((0.0).into()));
@@ -338,7 +476,14 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
     }
 
     // $run: the top-level statements.
-    let mut run = FnCompiler::new(&[], &signatures, alloc_idx);
+    let mut run = FnCompiler::new(
+        &[],
+        &signatures,
+        alloc_idx,
+        concat_idx,
+        logstr_idx,
+        &strings,
+    );
     run.compile_stmts(&main_stmts)?;
     let mut run_fn = Function::new(run.local_decls);
     for ins in &run.code {
@@ -362,6 +507,11 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
             wasm_encoder::EntityType::Function(*log_ty),
         );
     }
+    imports.import(
+        "env",
+        "logstr",
+        wasm_encoder::EntityType::Function(logstr_ty),
+    );
     module.section(&imports);
     module.section(&functions);
     let mut memories = MemorySection::new();
@@ -380,7 +530,7 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
             mutable: true,
             shared: false,
         },
-        &ConstExpr::i32_const(1024),
+        &ConstExpr::i32_const(arena_start as i32),
     );
     module.section(&globals);
     let mut exports = ExportSection::new();
@@ -388,10 +538,19 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
     exports.export("run", ExportKind::Func, fn_count);
     module.section(&exports);
     module.section(&code);
+    if !data_blob.is_empty() {
+        let mut data = DataSection::new();
+        for (addr, blob) in &data_blob {
+            data.active(0, &ConstExpr::i32_const(*addr as i32), blob.iter().copied());
+        }
+        module.section(&data);
+    }
     let bytes = module.finish();
-    validate(&bytes).map_err(|e| WasmError {
-        message: format!("internal: emitted module failed validation: {e}"),
-    })?;
+    if std::env::var("MEMJS_DEBUG").is_err() {
+        validate(&bytes).map_err(|e| WasmError {
+            message: format!("internal: emitted module failed validation: {e}"),
+        })?;
+    }
     Ok(bytes)
 }
 
@@ -406,16 +565,24 @@ struct FnCompiler<'s> {
     /// distance is `current depth - 1 - base`.
     loops: Vec<(u32, u32)>,
     alloc_idx: u32,
+    concat_idx: u32,
+    logstr_idx: u32,
+    /// Static string literal addresses (data segment), by content.
+    strings: &'s HashMap<String, usize>,
     /// Current label depth (blocks, loops, and ifs are labels).
     depth: u32,
     signatures: &'s HashMap<String, (u32, usize)>,
 }
 
 impl<'s> FnCompiler<'s> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         params: &[String],
         signatures: &'s HashMap<String, (u32, usize)>,
         alloc_idx: u32,
+        concat_idx: u32,
+        logstr_idx: u32,
+        strings: &'s HashMap<String, usize>,
     ) -> Self {
         let mut locals = HashMap::new();
         let mut next_local = 0u32;
@@ -433,6 +600,9 @@ impl<'s> FnCompiler<'s> {
             loops: Vec::new(),
             depth: 0,
             alloc_idx,
+            concat_idx,
+            logstr_idx,
+            strings,
             signatures,
         }
     }
@@ -449,6 +619,18 @@ impl<'s> FnCompiler<'s> {
         self.emit(Ins::LocalGet(t));
         self.emit(Ins::F64Eq);
         self.emit(Ins::I32And);
+    }
+
+    /// The static data-segment address of a string literal.
+    fn string_addr(&self, expr: &Expr) -> Result<usize, WasmError> {
+        match expr {
+            Expr::Str(text) => self
+                .strings
+                .get(text)
+                .copied()
+                .ok_or_else(|| self.err("unresolved string literal")),
+            _ => Err(self.err("not a string literal")),
+        }
     }
 
     fn fresh(&mut self, vt: ValType) -> u32 {
@@ -719,7 +901,24 @@ impl<'s> FnCompiler<'s> {
                 UnaryOp::Typeof => return Err(self.err("typeof")),
             },
             Expr::Binary(op, l, r) => match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                BinOp::Add => {
+                    // String concatenation: `+` with a string on either
+                    // side requires both sides to be strings and yields
+                    // a string.
+                    let lt = self.infer_expr(l)?;
+                    let rt = self.infer_expr(r)?;
+                    if lt == Ty::Str || rt == Ty::Str {
+                        if lt != Ty::Str || rt != Ty::Str {
+                            return Err(
+                                self.err("`+` between a string and a number (convert explicitly)")
+                            );
+                        }
+                        Ty::Str
+                    } else {
+                        Ty::Num
+                    }
+                }
+                BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                     self.infer_expr(l)?;
                     self.infer_expr(r)?;
                     Ty::Num
@@ -773,10 +972,11 @@ impl<'s> FnCompiler<'s> {
                 other => return Err(self.err(&format!("indexing a non-array ({other:?})"))),
             },
             Expr::Member(obj, prop) => {
-                if prop == "length" && self.infer_expr(obj)? == Ty::Arr {
+                let obj_ty = self.infer_expr(obj)?;
+                if prop == "length" && matches!(obj_ty, Ty::Arr | Ty::Str) {
                     Ty::Num
                 } else {
-                    return Err(self.err("member access (only arr.length exists)"));
+                    return Err(self.err("member access (only .length exists)"));
                 }
             }
             Expr::Call(callee, args) => {
@@ -812,7 +1012,7 @@ impl<'s> FnCompiler<'s> {
             Expr::Update(_, _, Target::Ident(_)) => Ty::Num,
             Expr::Update(..) => return Err(self.err("++/-- on non-locals")),
             Expr::Arrow(..) | Expr::Fn(..) => return Err(self.err("closures")),
-            Expr::Str(_) => return Err(self.err("strings")),
+            Expr::Str(_) => Ty::Str,
             Expr::Obj(_) => return Err(self.err("objects")),
             Expr::Null | Expr::Undefined => return Err(self.err("null/undefined")),
         })
@@ -878,6 +1078,20 @@ impl<'s> FnCompiler<'s> {
                 }
                 UnaryOp::Typeof => return Err(self.err("typeof")),
             },
+            Expr::Binary(_op @ BinOp::Add, l, r) => {
+                let lt = self.infer_expr(l)?;
+                let rt = self.infer_expr(r)?;
+                if lt == Ty::Str && rt == Ty::Str {
+                    // concat: $concat(a, b) -> ptr (a fresh arena copy).
+                    self.compile_expr(l, Some(Ty::Str))?;
+                    self.compile_expr(r, Some(Ty::Str))?;
+                    self.emit(Ins::Call(self.concat_idx));
+                    return Ok(Ty::Str);
+                }
+                self.compile_expr(l, Some(Ty::Num))?;
+                self.compile_expr(r, Some(Ty::Num))?;
+                self.emit(Ins::F64Add);
+            }
             Expr::Binary(op, l, r) => {
                 self.compile_expr(l, Some(Ty::Num))?;
                 self.compile_expr(r, Some(Ty::Num))?;
@@ -1045,11 +1259,11 @@ impl<'s> FnCompiler<'s> {
                 self.emit(Ins::End);
                 self.depth -= 1;
             }
-            Expr::Member(obj, prop) => {
-                if prop != "length" {
-                    return Err(self.err("member access (only arr.length exists)"));
-                }
-                self.compile_expr(obj, Some(Ty::Arr))?;
+            Expr::Member(obj, _prop) => {
+                // .length: byte length for strings, element count for
+                // arrays. Numeric in both cases.
+                let obj_ty = self.infer_expr(obj)?;
+                self.compile_expr(obj, Some(obj_ty))?;
                 self.emit(Ins::I32Load(MemArg {
                     offset: 0,
                     align: 2,
@@ -1058,11 +1272,37 @@ impl<'s> FnCompiler<'s> {
                 self.emit(Ins::F64ConvertI32U);
             }
             Expr::Call(callee, args) => {
-                // console.log(numeric): the host import (function 0).
-                // It returns nothing; a zero stands in for undefined so
-                // statement position stays balanced.
+                // console.log: all-numeric args go to log1..logN; a
+                // single string goes to logstr (the host decodes it
+                // from linear memory). Mixed calls are a v1 error.
                 if let Expr::Member(obj_expr, prop) = &**callee {
                     if matches!(**obj_expr, Expr::Ident(ref n) if n == "console") && prop == "log" {
+                        let mut all_num = true;
+                        let mut all_str = true;
+                        for a in args {
+                            match self.infer_expr(a)? {
+                                Ty::Num => all_str = false,
+                                Ty::Str => all_num = false,
+                                _ => {
+                                    return Err(self
+                                        .err("console.log arguments must be numbers or strings"))
+                                }
+                            }
+                        }
+                        if all_str {
+                            if args.len() != 1 {
+                                return Err(self.err("log one string per call in the WASM dialect"));
+                            }
+                            self.compile_expr(&args[0], Some(Ty::Str))?;
+                            self.emit(Ins::Call(self.logstr_idx));
+                            self.emit(Ins::F64Const(0.0.into()));
+                            return Ok(Ty::Num);
+                        }
+                        if !all_num {
+                            return Err(
+                                self.err("console.log cannot mix strings and numbers in one call")
+                            );
+                        }
                         for a in args {
                             self.compile_expr(a, Some(Ty::Num))?;
                         }
@@ -1123,10 +1363,128 @@ impl<'s> FnCompiler<'s> {
                 }
             }
             Expr::Arrow(..) | Expr::Fn(..) => return Err(self.err("closures")),
-            Expr::Str(_) => return Err(self.err("strings")),
+            Expr::Str(_) => {
+                // Static literal: its address lives in the data segment
+                // (i32 constant), collected by the module assembler.
+                let addr = self.string_addr(expr)?;
+                self.emit(Ins::I32Const(addr as i32));
+            }
             Expr::Obj(_) => return Err(self.err("objects")),
             Expr::Null | Expr::Undefined => return Err(self.err("null/undefined")),
         }
         Ok(ty)
+    }
+}
+
+/// Collects every string literal in a program item, in source order,
+/// deduplicated by content.
+fn collect_str_literals(item: &Item, out: &mut Vec<String>) {
+    fn push_str(expr: &Expr, out: &mut Vec<String>) {
+        if let Expr::Str(text) = expr {
+            if !out.contains(text) {
+                out.push(text.clone());
+            }
+        }
+    }
+    fn walk_expr(expr: &Expr, out: &mut Vec<String>) {
+        match expr {
+            Expr::Str(_) => push_str(expr, out),
+            Expr::Array(items) => items.iter().for_each(|e| walk_expr(e, out)),
+            Expr::Obj(entries) => entries.iter().for_each(|e| walk_expr(&e.value, out)),
+            Expr::Unary(_, e) => walk_expr(e, out),
+            Expr::Binary(_, l, r) | Expr::Logical(_, l, r) | Expr::Eq(_, l, r) => {
+                walk_expr(l, out);
+                walk_expr(r, out);
+            }
+            Expr::Assign(target, value) => {
+                match target {
+                    Target::Ident(_) => {}
+                    Target::Index(obj, idx) => {
+                        walk_expr(obj, out);
+                        walk_expr(idx, out);
+                    }
+                    Target::Member(obj, _) => walk_expr(obj, out),
+                }
+                walk_expr(value, out);
+            }
+            Expr::Index(obj, idx) => {
+                walk_expr(obj, out);
+                walk_expr(idx, out);
+            }
+            Expr::Member(obj, _) => walk_expr(obj, out),
+            Expr::Call(callee, args) => {
+                walk_expr(callee, out);
+                args.iter().for_each(|a| walk_expr(a, out));
+            }
+            Expr::Ternary(c, t, e) => {
+                walk_expr(c, out);
+                walk_expr(t, out);
+                walk_expr(e, out);
+            }
+            Expr::Update(_, _, target) => match target {
+                Target::Ident(_) => {}
+                Target::Index(obj, idx) => {
+                    walk_expr(obj, out);
+                    walk_expr(idx, out);
+                }
+                Target::Member(obj, _) => walk_expr(obj, out),
+            },
+            _ => {}
+        }
+    }
+    fn walk_stmt(stmt: &Stmt, out: &mut Vec<String>) {
+        match stmt {
+            Stmt::Let { decls, .. } | Stmt::Var { decls, .. } => {
+                for (_, init) in decls {
+                    if let Some(init) = init {
+                        walk_expr(init, out);
+                    }
+                }
+            }
+            Stmt::Expr(expr) => walk_expr(expr, out),
+            Stmt::If(cond, then, els) => {
+                walk_expr(cond, out);
+                walk_stmt(then, out);
+                if let Some(els) = els {
+                    walk_stmt(els, out);
+                }
+            }
+            Stmt::While(cond, body) => {
+                walk_expr(cond, out);
+                walk_stmt(body, out);
+            }
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                if let Some(init) = init {
+                    walk_stmt(init, out);
+                }
+                if let Some(cond) = cond {
+                    walk_expr(cond, out);
+                }
+                if let Some(step) = step {
+                    walk_expr(step, out);
+                }
+                walk_stmt(body, out);
+            }
+            Stmt::ForOf { iterable, body, .. } | Stmt::ForIn { iterable, body, .. } => {
+                walk_expr(iterable, out);
+                walk_stmt(body, out);
+            }
+            Stmt::Block(stmts) => stmts.iter().for_each(|s| walk_stmt(s, out)),
+            Stmt::Return(Some(expr)) => walk_expr(expr, out),
+            _ => {}
+        }
+    }
+    match item {
+        Item::Fn(def) => {
+            for stmt in &def.body {
+                walk_stmt(stmt, out);
+            }
+        }
+        Item::Stmt(stmt) => walk_stmt(stmt, out),
     }
 }

@@ -27,6 +27,16 @@ const WASM_FIXTURES: &[&str] = &[
     "// @own\nlet a = [10, 20, 30];\nconsole.log(a[0], a[1], a[2], a.length);",
     "// @own\nlet a = [1, 2, 3];\na[1] = 20;\nlet sum = 0;\nfor (const v of a) { sum += v; }\nconsole.log(sum, a.length);",
     "// @own\nlet a = [3, 1, 2];\nlet total = 0;\nfor (let i = 0; i < a.length; i++) { total += a[i]; }\nconsole.log(total);",
+    // strings: static literals, concatenation, byte length
+    r#"console.log("hello");"#,
+    r#"let who = "world"; console.log("hello " + who);"#,
+    r#"console.log("a" + "b" + "c");"#,
+    r#"const s = "abc"; console.log(s.length);"#,
+    r#"let greeting = "hi"; console.log(greeting + "!");"#,
+    r#"// @own
+let a = [1, 2];
+console.log("sum incoming");
+console.log(a[0] + a[1]);"#,
 ];
 
 #[test]
@@ -70,10 +80,13 @@ fn unannotated_arrays_are_rejected() {
 #[test]
 fn heap_types_are_rejected_in_the_strict_dialect() {
     for src in [
-        r#"console.log("str");"#,
         "console.log({ a: 1 });",
         "const f = () => 1; console.log(f());",
         "console.log(typeof 1);",
+        // Mixed string/number concatenation has no JS coercion here.
+        r#"console.log("a" + 1);"#,
+        // Multi-string logs are single-value in v1.
+        r#"console.log("a", "b");"#,
     ] {
         let err = compile_to_wasm(src).unwrap_err();
         assert!(

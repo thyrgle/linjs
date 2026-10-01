@@ -1,4 +1,5 @@
-//! linjs — a JavaScript subset with incremental bones.
+//! linjs — a JavaScript subset with incremental bones and a memory
+//! contract.
 //!
 //! A pilot built on [`increparse`] to prove the compiler pattern: the
 //! engine segments a source file into top-level items and parses each
@@ -150,14 +151,23 @@ pub fn check_wasm_against_node(source: &str) -> Result<(), String> {
     let js = "const b = Buffer.from('".to_string()
         + &hex
         + "', 'hex');\n"
+        + "let mem = null;\n"
+        + "const dec = new TextDecoder();\n"
         + "const env = new Proxy({}, { get: (t, name) => {\n"
+        + "  if (typeof name === 'string' && name === 'logstr') {\n"
+        + "    return (p) => {\n"
+        + "      const len = new DataView(mem.buffer).getUint32(p, true);\n"
+        + "      const bytes = new Uint8Array(mem.buffer, p + 8, len);\n"
+        + "      console.log(dec.decode(bytes));\n"
+        + "    };\n"
+        + "  }\n"
         + "  if (typeof name === 'string' && name.startsWith('log')) {\n"
         + "    return (...xs) => console.log(...xs);\n"
         + "  }\n"
         + "  return undefined;\n"
         + "} });\n"
         + "WebAssembly.instantiate(b, { env })\n"
-        + ".then(r => r.instance.exports.run());";
+        + ".then(r => { mem = r.instance.exports.memory; r.instance.exports.run(); });";
     let output = std::process::Command::new(node)
         .arg("-e")
         .arg(js)

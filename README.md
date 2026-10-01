@@ -96,10 +96,11 @@ Node.
 
 `linjs::compile_to_wasm` compiles the **strict dialect** — numbers,
 booleans, control flow, functions, and `// @own` arrays — to a real
-WebAssembly module. `@own` arrays live in linear memory, bump-allocated
-from a per-frame arena; the escape rules guarantee frame teardown is a
-pointer reset, so annotated code runs with **no garbage collector
-anywhere in the pipeline**. Unannotated arrays are a compile error: in
+WebAssembly module. `@own` arrays and strings live in linear memory — strings as static
+data-segment literals plus arena-allocated concatenations —
+bump-allocated from a per-frame arena; the escape rules guarantee
+frame teardown is a pointer reset, so annotated code runs with **no
+garbage collector anywhere in the pipeline**. Unannotated arrays are a compile error: in
 linear memory there is nothing to fall back on. The differential
 harness instantiates the emitted module in Node and checks its output
 against the interpreter byte for byte.
