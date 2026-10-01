@@ -8,4 +8,4 @@ repository = "https://github.com/thyrgle/memjs"
 readme = "README.md"
 
 [dependencies]
-increparse = { path = "../increparse/crates/increparse", version = "0.1.0" }
+increparse = "0.1.0"
