@@ -45,6 +45,13 @@ pub struct WasmError {
     pub message: String,
 }
 
+/// And/Or/Xor results are i32: JavaScript converts both operands via
+/// ToInt32 before the operation.
+#[allow(non_snake_case)]
+fn I32_unified() -> Ty {
+    Ty::I32
+}
+
 fn unsupported(what: &str) -> WasmError {
     WasmError {
         message: format!("WASM backend (strict dialect): {what} is not supported"),
@@ -81,19 +88,6 @@ impl Ty {
     /// require.
     fn is_int(self) -> bool {
         matches!(self, Ty::I32 | Ty::U32 | Ty::I64 | Ty::U64)
-    }
-
-    /// For UShr result typing: unsigned shift yields the unsigned
-    /// variant when available.
-    fn max_int(self, other: Ty) -> Ty {
-        let _ = other;
-        match self {
-            Ty::I32 | Ty::Num => Ty::I32,
-            Ty::U32 => Ty::U32,
-            Ty::I64 => Ty::I64,
-            Ty::U64 => Ty::U64,
-            other => other,
-        }
     }
 
     /// The element size in linear memory for arrays of this type
@@ -529,6 +523,7 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
             &param_names,
             &signatures,
             alloc_idx,
+            allocb_idx,
             concat_idx,
             logstr_idx,
             &strings,
@@ -555,6 +550,7 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
         &[],
         &signatures,
         alloc_idx,
+        allocb_idx,
         concat_idx,
         logstr_idx,
         &strings,
@@ -640,6 +636,7 @@ struct FnCompiler<'s> {
     /// distance is `current depth - 1 - base`.
     loops: Vec<(u32, u32)>,
     alloc_idx: u32,
+    allocb_idx: u32,
     concat_idx: u32,
     logstr_idx: u32,
     /// Static string literal addresses (data segment), by content.
@@ -655,6 +652,7 @@ impl<'s> FnCompiler<'s> {
         params: &[String],
         signatures: &'s HashMap<String, (u32, usize)>,
         alloc_idx: u32,
+        allocb_idx: u32,
         concat_idx: u32,
         logstr_idx: u32,
         strings: &'s HashMap<String, usize>,
@@ -675,6 +673,7 @@ impl<'s> FnCompiler<'s> {
             loops: Vec::new(),
             depth: 0,
             alloc_idx,
+            allocb_idx,
             concat_idx,
             logstr_idx,
             strings,
@@ -956,11 +955,11 @@ impl<'s> FnCompiler<'s> {
         iterable: &Expr,
         body: &Stmt,
     ) -> Result<(), WasmError> {
-        let arr_ty = self.infer_expr(iterable)?;
-        if arr_ty != Ty::Arr {
-            return Err(self.err("for..of over a non-array"));
-        }
-        self.compile_expr(iterable, Some(Ty::Arr))?;
+        // i32[] iterates as f64 element values (converted per read), so
+        // the loop variable stays a number in both dialects.
+        let is_i32 = self.infer_expr(iterable)? == Ty::ArrI32;
+        let arr_ty = if is_i32 { Ty::ArrI32 } else { Ty::Arr };
+        self.compile_expr(iterable, Some(arr_ty))?;
         let arr = self.fresh(ValType::I32);
         self.emit(Ins::LocalSet(arr));
         let i = self.fresh(ValType::I32);
@@ -984,17 +983,27 @@ impl<'s> FnCompiler<'s> {
         }));
         self.emit(Ins::I32GeU);
         self.emit(Ins::BrIf(2));
-        // v = arr[i]
+        // v = arr[i] — i32 arrays load at the 4-byte stride and
+        // convert to the loop variable's f64.
         self.emit(Ins::LocalGet(arr));
         self.emit(Ins::LocalGet(i));
-        self.emit(Ins::I32Const(8));
+        self.emit(Ins::I32Const(if is_i32 { 4 } else { 8 }));
         self.emit(Ins::I32Mul);
         self.emit(Ins::I32Add);
-        self.emit(Ins::F64Load(MemArg {
-            offset: 8,
-            align: 3,
-            memory_index: 0,
-        }));
+        if is_i32 {
+            self.emit(Ins::I32Load(MemArg {
+                offset: 8,
+                align: 2,
+                memory_index: 0,
+            }));
+            self.emit(Ins::F64ConvertI32S);
+        } else {
+            self.emit(Ins::F64Load(MemArg {
+                offset: 8,
+                align: 3,
+                memory_index: 0,
+            }));
+        }
         let v = self.fresh(ValType::F64);
         self.emit(Ins::LocalSet(v));
         self.locals.insert(name.to_string(), (v, Ty::Num));
@@ -1024,24 +1033,29 @@ impl<'s> FnCompiler<'s> {
             Expr::Array(_) => Ty::Arr,
             Expr::Str(_) => Ty::Str,
             Expr::Bit(op, l, r) => {
-                // Bitwise ops require integer operands (literals adapt:
-                // a Num operand reads as i32 in a bitwise context).
-                let lt = match self.infer_expr(l)? {
-                    Ty::Num => Ty::I32,
-                    other => other,
+                // Bitwise ops require integer operands (Num literals
+                // adapt to i32). And/Or/Xor always yield i32 —
+                // JavaScript converts both operands via ToInt32 — while
+                // UShr yields the unsigned type so a following div/rem
+                // is unsigned (matching JS's unsigned result).
+                let int_of = |ty: Ty| match ty {
+                    Ty::Num => Some(Ty::I32),
+                    t if t.is_int() => Some(t),
+                    _ => None,
                 };
-                let rt = match self.infer_expr(r)? {
-                    Ty::Num => Ty::I32,
-                    other => other,
-                };
-                if !lt.is_int() || !rt.is_int() || lt != rt {
-                    return Err(self.err(
-                        "bitwise operators require matching integer operands (i32/u32/i64/u64)",
-                    ));
-                }
+                let lt = int_of(self.infer_expr(l)?)
+                    .ok_or_else(|| self.err("bitwise operands must be integers"))?;
+                let rt = int_of(self.infer_expr(r)?)
+                    .ok_or_else(|| self.err("bitwise operands must be integers"))?;
                 match op {
-                    BitOp::UShr => Ty::U32.max_int(lt),
-                    _ => lt,
+                    BitOp::UShr => Ty::U32,
+                    BitOp::Shl | BitOp::Shr => {
+                        if lt != rt {
+                            return Err(self.err("shift operands must have the same integer type"));
+                        }
+                        lt
+                    }
+                    _ => I32_unified(),
                 }
             }
             Expr::BitNot(e) => match self.infer_expr(e)? {
@@ -1068,7 +1082,8 @@ impl<'s> FnCompiler<'s> {
                 BinOp::Add => {
                     // String concatenation: `+` with a string on either
                     // side requires both sides to be strings and yields
-                    // a string.
+                    // a string. Integer operands (either side) yield the
+                    // integer type; Num operands adapt at compile time.
                     let lt = self.infer_expr(l)?;
                     let rt = self.infer_expr(r)?;
                     if lt == Ty::Str || rt == Ty::Str {
@@ -1078,14 +1093,24 @@ impl<'s> FnCompiler<'s> {
                             );
                         }
                         Ty::Str
+                    } else if lt.is_int() {
+                        lt
+                    } else if rt.is_int() {
+                        rt
                     } else {
                         Ty::Num
                     }
                 }
                 BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                    self.infer_expr(l)?;
-                    self.infer_expr(r)?;
-                    Ty::Num
+                    let lt = self.infer_expr(l)?;
+                    let rt = self.infer_expr(r)?;
+                    if lt.is_int() {
+                        lt
+                    } else if rt.is_int() {
+                        rt
+                    } else {
+                        Ty::Num
+                    }
                 }
                 BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
                     self.infer_expr(l)?;
@@ -1132,12 +1157,12 @@ impl<'s> FnCompiler<'s> {
                 Target::Member(..) => return Err(self.err("member assignment")),
             },
             Expr::Index(obj, _) => match self.infer_expr(obj)? {
-                Ty::Arr => Ty::Num,
+                Ty::Arr | Ty::ArrI32 => Ty::Num,
                 other => return Err(self.err(&format!("indexing a non-array ({other:?})"))),
             },
             Expr::Member(obj, prop) => {
                 let obj_ty = self.infer_expr(obj)?;
-                if prop == "length" && matches!(obj_ty, Ty::Arr | Ty::Str) {
+                if prop == "length" && matches!(obj_ty, Ty::Arr | Ty::ArrI32 | Ty::Str) {
                     Ty::Num
                 } else {
                     return Err(self.err("member access (only .length exists)"));
@@ -1202,17 +1227,18 @@ impl<'s> FnCompiler<'s> {
                         return Ok(Ty::Num);
                     }
                     // An integral literal adapts to the expected integer
-                    // or half-width float type (`let x: i32 = 5`).
-                    (Ty::Num, Ty::I32) | (Ty::Num, Ty::U32) if matches!(expr, Expr::Num(n) if n.fract() == 0.0 && *n >= i32::MIN as f64 && *n <= u32::MAX as f64) =>
+                    // type with WRAPPING bit semantics (`let key: i32 =
+                    // 0x9E3779B9` keeps the bit pattern, not a saturate).
+                    (Ty::Num, Ty::I32) | (Ty::Num, Ty::U32) if matches!(expr, Expr::Num(n) if n.fract() == 0.0 && n.abs() <= u64::MAX as f64) =>
                     {
                         let v = match expr {
-                            Expr::Num(n) => *n as i32,
+                            Expr::Num(n) => (*n as i64) as i32,
                             _ => unreachable!(),
                         };
                         self.emit(Ins::I32Const(v));
                         return Ok(expect);
                     }
-                    (Ty::Num, Ty::I64) | (Ty::Num, Ty::U64) if matches!(expr, Expr::Num(n) if n.fract() == 0.0) =>
+                    (Ty::Num, Ty::I64) | (Ty::Num, Ty::U64) if matches!(expr, Expr::Num(n) if n.fract() == 0.0 && n.abs() <= i64::MAX as f64) =>
                     {
                         let v = match expr {
                             Expr::Num(n) => *n as i64,
@@ -1226,7 +1252,22 @@ impl<'s> FnCompiler<'s> {
                         self.emit(Ins::F32DemoteF64);
                         return Ok(Ty::F32);
                     }
-                    _ => return Err(self.err(&format!("expected {expect:?}, found {ty:?}"))),
+                    // Array literal against an annotated i32[]: the
+                    // Array arm reads `expect` and emits the i32 path.
+                    (Ty::Arr, Ty::ArrI32) => {
+                        ty = Ty::ArrI32;
+                    }
+                    // i32/u32 share a valtype — the signedness lives in
+                    // the operations, not the values.
+                    (Ty::I32, Ty::U32) | (Ty::U32, Ty::I32) => {
+                        ty = expect;
+                    }
+                    _ => {
+                        if std::env::var("MEMJS_DEBUG").is_ok() {
+                            eprintln!("DBG expect {expect:?} found {ty:?} at {expr:?}");
+                        }
+                        return Err(self.err(&format!("expected {expect:?}, found {ty:?}")));
+                    }
                 }
             }
         }
@@ -1239,7 +1280,35 @@ impl<'s> FnCompiler<'s> {
                 self.emit(Ins::LocalGet(idx));
             }
             Expr::Array(items) => {
-                // ptr = $alloc(len); store each element at ptr+8+8i.
+                // An expected ArrI32 (from `let xs: i32[] = ...`) takes
+                // the 4-byte-stride path via the raw bump allocator;
+                // everything else is the f64 path via $alloc.
+                if expect == Some(Ty::ArrI32) {
+                    let bytes = (8 + 4 * items.len()) as i32;
+                    self.emit(Ins::I32Const(bytes));
+                    self.emit(Ins::Call(self.allocb_idx));
+                    let ptr = self.fresh(ValType::I32);
+                    self.emit(Ins::LocalSet(ptr));
+                    // Header: element count at ptr + 0.
+                    self.emit(Ins::LocalGet(ptr));
+                    self.emit(Ins::I32Const(items.len() as i32));
+                    self.emit(Ins::I32Store(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+                    for (i, item) in items.iter().enumerate() {
+                        self.emit(Ins::LocalGet(ptr));
+                        self.compile_expr(item, Some(Ty::I32))?;
+                        self.emit(Ins::I32Store(MemArg {
+                            offset: (8 + 4 * i) as u64,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                    }
+                    self.emit(Ins::LocalGet(ptr));
+                    return Ok(Ty::ArrI32);
+                }
                 self.emit(Ins::I32Const(items.len() as i32));
                 self.emit(Ins::Call(self.alloc_idx)); // $alloc
                 let ptr = self.fresh(ValType::I32);
@@ -1276,11 +1345,120 @@ impl<'s> FnCompiler<'s> {
                     self.emit(Ins::Call(self.concat_idx));
                     return Ok(Ty::Str);
                 }
+                let lt = self.infer_expr(l)?;
+                let rt = self.infer_expr(r)?;
+                // `int + int` is integer addition in the dialect; a Num
+                // literal adapts, a Num variable is a mixed error.
+                if lt.is_int() || rt.is_int() {
+                    let op_ty = if lt.is_int() { lt } else { rt };
+                    self.compile_expr(l, Some(op_ty))?;
+                    self.compile_expr(r, Some(op_ty))?;
+                    self.emit(match op_ty {
+                        Ty::I64 | Ty::U64 => Ins::I64Add,
+                        _ => Ins::I32Add,
+                    });
+                    return Ok(op_ty);
+                }
+                if lt.is_int() && lt == rt {
+                    self.compile_expr(l, Some(lt))?;
+                    self.compile_expr(r, Some(lt))?;
+                    self.emit(match lt {
+                        Ty::I64 | Ty::U64 => Ins::I64Add,
+                        _ => Ins::I32Add,
+                    });
+                    return Ok(lt);
+                }
                 self.compile_expr(l, Some(Ty::Num))?;
                 self.compile_expr(r, Some(Ty::Num))?;
                 self.emit(Ins::F64Add);
             }
             Expr::Binary(op, l, r) => {
+                // Typed-operand dispatch: if either side is an integer,
+                // the whole op runs as that integer type (a Num literal
+                // adapts; a Num *variable* is a mixed-arithmetic error).
+                let lt = self.infer_expr(l)?;
+                let rt = self.infer_expr(r)?;
+                if lt.is_int() || rt.is_int() {
+                    let op_ty = if lt.is_int() { lt } else { rt };
+                    self.compile_expr(l, Some(op_ty))?;
+                    self.compile_expr(r, Some(op_ty))?;
+                    match (op, op_ty) {
+                        (BinOp::Add, Ty::I64 | Ty::U64) => self.emit(Ins::I64Add),
+                        (BinOp::Add, _) => self.emit(Ins::I32Add),
+                        (BinOp::Sub, Ty::I64 | Ty::U64) => self.emit(Ins::I64Sub),
+                        (BinOp::Sub, _) => self.emit(Ins::I32Sub),
+                        (BinOp::Mul, Ty::I64 | Ty::U64) => self.emit(Ins::I64Mul),
+                        (BinOp::Mul, _) => self.emit(Ins::I32Mul),
+                        (BinOp::Div, Ty::I64) => self.emit(Ins::I64DivS),
+                        (BinOp::Div, Ty::U64) => self.emit(Ins::I64DivU),
+                        (BinOp::Div, Ty::U32) => self.emit(Ins::I32DivU),
+                        (BinOp::Div, _) => self.emit(Ins::I32DivS),
+                        (BinOp::Rem, Ty::I64) => self.emit(Ins::I64RemS),
+                        (BinOp::Rem, Ty::U64) => self.emit(Ins::I64RemU),
+                        (BinOp::Rem, Ty::U32) => self.emit(Ins::I32RemU),
+                        (BinOp::Rem, _) => self.emit(Ins::I32RemS),
+                        (BinOp::Lt, Ty::I64) => self.emit(Ins::I64LtS),
+                        (BinOp::Lt, Ty::U64) => self.emit(Ins::I64LtU),
+                        (BinOp::Lt, Ty::U32) => self.emit(Ins::I32LtU),
+                        (BinOp::Lt, _) => self.emit(Ins::I32LtS),
+                        (BinOp::Gt, Ty::I64) => self.emit(Ins::I64GtS),
+                        (BinOp::Gt, Ty::U64) => self.emit(Ins::I64GtU),
+                        (BinOp::Gt, Ty::U32) => self.emit(Ins::I32GtU),
+                        (BinOp::Gt, _) => self.emit(Ins::I32GtS),
+                        (BinOp::Le, Ty::I64) => self.emit(Ins::I64LeS),
+                        (BinOp::Le, Ty::U64) => self.emit(Ins::I64LeU),
+                        (BinOp::Le, Ty::U32) => self.emit(Ins::I32LeU),
+                        (BinOp::Le, _) => self.emit(Ins::I32LeS),
+                        (BinOp::Ge, Ty::I64) => self.emit(Ins::I64GeS),
+                        (BinOp::Ge, Ty::U64) => self.emit(Ins::I64GeU),
+                        (BinOp::Ge, Ty::U32) => self.emit(Ins::I32GeU),
+                        (BinOp::Ge, _) => self.emit(Ins::I32GeS),
+                    }
+                    if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge) {
+                        return Ok(Ty::Bool);
+                    }
+                    return Ok(op_ty);
+                }
+                if lt.is_int() && lt == rt {
+                    self.compile_expr(l, Some(lt))?;
+                    self.compile_expr(r, Some(lt))?;
+                    match (op, lt) {
+                        (BinOp::Add, Ty::I64 | Ty::U64) => self.emit(Ins::I64Add),
+                        (BinOp::Add, _) => self.emit(Ins::I32Add),
+                        (BinOp::Sub, Ty::I64 | Ty::U64) => self.emit(Ins::I64Sub),
+                        (BinOp::Sub, _) => self.emit(Ins::I32Sub),
+                        (BinOp::Mul, Ty::I64 | Ty::U64) => self.emit(Ins::I64Mul),
+                        (BinOp::Mul, _) => self.emit(Ins::I32Mul),
+                        (BinOp::Div, Ty::I64) => self.emit(Ins::I64DivS),
+                        (BinOp::Div, Ty::U64) => self.emit(Ins::I64DivU),
+                        (BinOp::Div, Ty::U32) => self.emit(Ins::I32DivU),
+                        (BinOp::Div, _) => self.emit(Ins::I32DivS),
+                        (BinOp::Rem, Ty::I64) => self.emit(Ins::I64RemS),
+                        (BinOp::Rem, Ty::U64) => self.emit(Ins::I64RemU),
+                        (BinOp::Rem, Ty::U32) => self.emit(Ins::I32RemU),
+                        (BinOp::Rem, _) => self.emit(Ins::I32RemS),
+                        (BinOp::Lt, Ty::I64) => self.emit(Ins::I64LtS),
+                        (BinOp::Lt, Ty::U64) => self.emit(Ins::I64LtU),
+                        (BinOp::Lt, Ty::U32) => self.emit(Ins::I32LtU),
+                        (BinOp::Lt, _) => self.emit(Ins::I32LtS),
+                        (BinOp::Gt, Ty::I64) => self.emit(Ins::I64GtS),
+                        (BinOp::Gt, Ty::U64) => self.emit(Ins::I64GtU),
+                        (BinOp::Gt, Ty::U32) => self.emit(Ins::I32GtU),
+                        (BinOp::Gt, _) => self.emit(Ins::I32GtS),
+                        (BinOp::Le, Ty::I64) => self.emit(Ins::I64LeS),
+                        (BinOp::Le, Ty::U64) => self.emit(Ins::I64LeU),
+                        (BinOp::Le, Ty::U32) => self.emit(Ins::I32LeU),
+                        (BinOp::Le, _) => self.emit(Ins::I32LeS),
+                        (BinOp::Ge, Ty::I64) => self.emit(Ins::I64GeS),
+                        (BinOp::Ge, Ty::U64) => self.emit(Ins::I64GeU),
+                        (BinOp::Ge, Ty::U32) => self.emit(Ins::I32GeU),
+                        (BinOp::Ge, _) => self.emit(Ins::I32GeS),
+                    }
+                    if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge) {
+                        return Ok(Ty::Bool);
+                    }
+                    return Ok(lt);
+                }
                 self.compile_expr(l, Some(Ty::Num))?;
                 self.compile_expr(r, Some(Ty::Num))?;
                 self.emit(match op {
@@ -1311,6 +1489,35 @@ impl<'s> FnCompiler<'s> {
                 });
             }
             Expr::Eq(op, l, r) => {
+                let lt = self.infer_expr(l)?;
+                let rt = self.infer_expr(r)?;
+                if lt.is_int() || rt.is_int() {
+                    let op_ty = if lt.is_int() { lt } else { rt };
+                    self.compile_expr(l, Some(op_ty))?;
+                    self.compile_expr(r, Some(op_ty))?;
+                    let eq = match op_ty {
+                        Ty::I64 | Ty::U64 => Ins::I64Eq,
+                        _ => Ins::I32Eq,
+                    };
+                    self.emit(eq);
+                    if matches!(op, EqOp::LooseNe | EqOp::StrictNe) {
+                        self.emit(Ins::I32Eqz);
+                    }
+                    return Ok(Ty::Bool);
+                }
+                if lt.is_int() && lt == rt {
+                    self.compile_expr(l, Some(lt))?;
+                    self.compile_expr(r, Some(lt))?;
+                    let eq = match lt {
+                        Ty::I64 | Ty::U64 => Ins::I64Eq,
+                        _ => Ins::I32Eq,
+                    };
+                    self.emit(eq);
+                    if matches!(op, EqOp::LooseNe | EqOp::StrictNe) {
+                        self.emit(Ins::I32Eqz);
+                    }
+                    return Ok(Ty::Bool);
+                }
                 self.compile_expr(l, Some(Ty::Num))?;
                 self.compile_expr(r, Some(Ty::Num))?;
                 self.emit(Ins::F64Eq);
@@ -1420,7 +1627,17 @@ impl<'s> FnCompiler<'s> {
                     self.emit(Ins::LocalTee(idx));
                 }
                 Target::Index(obj, idx) => {
-                    self.compile_expr(obj, Some(Ty::Arr))?;
+                    // Evaluate obj and idx exactly once, into temps;
+                    // dispatch f64 vs i32 elements on the array's type.
+                    let obj_ty = self.infer_expr(obj)?;
+                    if !matches!(obj_ty, Ty::Arr | Ty::ArrI32) {
+                        return Err(self.err("index assignment on a non-array"));
+                    }
+                    let (elem_size, is_i32) = match obj_ty {
+                        Ty::ArrI32 => (4u32, true),
+                        _ => (8u32, false),
+                    };
+                    self.compile_expr(obj, Some(obj_ty))?;
                     let t_obj = self.fresh(ValType::I32);
                     self.emit(Ins::LocalSet(t_obj));
                     self.compile_expr(idx, Some(Ty::Num))?;
@@ -1447,15 +1664,25 @@ impl<'s> FnCompiler<'s> {
                     self.compile_expr(value, Some(Ty::Num))?;
                     self.emit(Ins::LocalGet(t_obj));
                     self.emit(Ins::LocalGet(i32_idx));
-                    self.emit(Ins::I32Const(8));
+                    self.emit(Ins::I32Const(elem_size as i32));
                     self.emit(Ins::I32Mul);
                     self.emit(Ins::I32Add);
                     self.compile_expr(value, Some(Ty::Num))?;
-                    self.emit(Ins::F64Store(MemArg {
-                        offset: 8,
-                        align: 3,
-                        memory_index: 0,
-                    }));
+                    if is_i32 {
+                        // i32 elements truncate the assigned f64.
+                        self.emit(Ins::I32TruncF64S);
+                        self.emit(Ins::I32Store(MemArg {
+                            offset: 8,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                    } else {
+                        self.emit(Ins::F64Store(MemArg {
+                            offset: 8,
+                            align: 3,
+                            memory_index: 0,
+                        }));
+                    }
                     self.emit(Ins::Else);
                     self.emit(Ins::F64Const((f64::NAN).into()));
                     self.emit(Ins::End);
@@ -1464,7 +1691,18 @@ impl<'s> FnCompiler<'s> {
                 Target::Member(..) => return Err(self.err("member assignment")),
             },
             Expr::Index(obj, idx) => {
-                self.compile_expr(obj, Some(Ty::Arr))?;
+                // Reads always yield f64 (JS-identical): f64 arrays load
+                // F64 directly; i32 arrays load I32 at the 4-byte stride
+                // and convert.
+                let obj_ty = self.infer_expr(obj)?;
+                if !matches!(obj_ty, Ty::Arr | Ty::ArrI32) {
+                    return Err(self.err("indexing a non-array"));
+                }
+                let (elem_size, is_i32) = match obj_ty {
+                    Ty::ArrI32 => (4u32, true),
+                    _ => (8u32, false),
+                };
+                self.compile_expr(obj, Some(obj_ty))?;
                 let t_obj = self.fresh(ValType::I32);
                 self.emit(Ins::LocalSet(t_obj));
                 self.compile_expr(idx, Some(Ty::Num))?;
@@ -1485,14 +1723,23 @@ impl<'s> FnCompiler<'s> {
                 self.depth += 1;
                 self.emit(Ins::LocalGet(t_obj));
                 self.emit(Ins::LocalGet(i32_idx));
-                self.emit(Ins::I32Const(8));
+                self.emit(Ins::I32Const(elem_size as i32));
                 self.emit(Ins::I32Mul);
                 self.emit(Ins::I32Add);
-                self.emit(Ins::F64Load(MemArg {
-                    offset: 8,
-                    align: 3,
-                    memory_index: 0,
-                }));
+                if is_i32 {
+                    self.emit(Ins::I32Load(MemArg {
+                        offset: 8,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+                    self.emit(Ins::F64ConvertI32S);
+                } else {
+                    self.emit(Ins::F64Load(MemArg {
+                        offset: 8,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                }
                 self.emit(Ins::Else);
                 self.emit(Ins::F64Const((f64::NAN).into()));
                 self.emit(Ins::End);
@@ -1591,22 +1838,30 @@ impl<'s> FnCompiler<'s> {
                     Target::Ident(n) => n.clone(),
                     _ => return Err(self.err("++/-- on non-locals")),
                 };
-                let (idx, _) = self
+                let (idx, local_ty) = self
                     .locals
                     .get(&name)
                     .copied()
                     .ok_or_else(|| self.err("unknown variable"))?;
+                // Integer locals step with integer ops; f64 locals with
+                // f64 ops.
+                let (one, add, sub) = match local_ty {
+                    Ty::I64 | Ty::U64 => (Ins::I64Const(1), Ins::I64Add, Ins::I64Sub),
+                    Ty::I32 | Ty::U32 => (Ins::I32Const(1), Ins::I32Add, Ins::I32Sub),
+                    _ => (Ins::F64Const((1.0).into()), Ins::F64Add, Ins::F64Sub),
+                };
+                let (inc, _dec) = match op {
+                    UpdateOp::Inc => (add, sub),
+                    UpdateOp::Dec => (sub, add),
+                };
                 if !*prefix {
                     // The result is the old value, loaded first; the
                     // store below consumes the new one.
                     self.emit(Ins::LocalGet(idx));
                 }
                 self.emit(Ins::LocalGet(idx));
-                self.emit(Ins::F64Const((1.0).into()));
-                self.emit(match op {
-                    UpdateOp::Inc => Ins::F64Add,
-                    UpdateOp::Dec => Ins::F64Sub,
-                });
+                self.emit(one);
+                self.emit(inc);
                 if *prefix {
                     // The new value is the result: Tee stores it and
                     // leaves it on the stack.

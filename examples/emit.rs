@@ -11,9 +11,12 @@ const KERNELS: &[&str] = &[
     "fib",
     "loop-arith",
     "array-sum",
+    "array-sum-i32",
+    "bit-arith",
     "string-build",
     "calls",
     "alloc-frame",
+    "dbg",
 ];
 
 fn main() {

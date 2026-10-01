@@ -166,6 +166,26 @@ pub fn lex(source: &str) -> Result<Lexed, LexError> {
                     text: source[start + 2..i - 2].to_string(),
                 });
             }
+            b'0' if i + 1 < bytes.len() && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') => {
+                // Hex literal: 0x9E3779B9 etc. Reads as a number.
+                let start = i;
+                i += 2;
+                while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                    i += 1;
+                }
+                let text = &source[start..i];
+                let value: f64 = u64::from_str_radix(&source[start + 2..i], 16)
+                    .map(|bits| bits as f64)
+                    .map_err(|_| LexError {
+                        at: start,
+                        message: format!("bad hex literal `{text}`"),
+                    })?;
+                tokens.push(Token {
+                    kind: Tok::Num(value),
+                    start,
+                    end: i,
+                });
+            }
             b'0'..=b'9' => {
                 let start = i;
                 while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {

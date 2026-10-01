@@ -70,6 +70,27 @@ a trunc, and a branch per element access. That gap is compiler work
 (redundant-elimination passes we don't do yet), not a memory-model
 cost. The memory model shows up in E3 instead.
 
+## E6 — Integer dialect (M9 follow-up)
+
+With Rust-style numeric types landed, two integer kernels join the
+suite — and **bit-arith reaches parity with V8 (1.0×)**: a chain of
+`+ ^ << | >>>` on i32 locals maps 1:1 to wasm integer instructions,
+and V8's Smi path holds no advantage on the same operations. The
+remaining gaps are the known compiler taxes: `array-sum-i32` at 3.7×
+(bounds check + truncate per element read, on top of the f64→i32
+conversion for JS-identical reads) — bounds-check elimination is the
+next compiler lever, with i32[] arrays already at half the linear
+memory of f64[].
+
+| Kernel | linjs WASM | V8 (JS) | ratio |
+|---|---|---|---|
+| bit-arith (i32 locals, bitwise chain) | 0.36 ms | 0.36 ms | **1.0×** |
+| array-sum-i32 (i32[] elements) | 1.30 ms | 0.35 ms | 3.7× |
+
+Checksums verified against the interpreter and Node before timing.
+Integer division and casts trap in the dialect (documented
+divergences); the kernels avoid div-by-zero.
+
 ## E3 — Allocation latency (the differentiator)
 
 One allocation cycle per call, 100,000 calls, per-call sampling:

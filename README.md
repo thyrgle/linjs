@@ -88,7 +88,8 @@ reported, and V8 gets 2,000 warmup iterations so it is measured at its
 optimizing best. Headline: the compiled WASM beats V8 on
 call-heavy f64 code (~4x on fib), loses 1.2-3x on loop/array work,
 and — the point of the memory model — allocation latency is flat after
-one-time arena growth, with no GC pauses. Method and numbers:
+one-time arena growth, with no GC pauses. Integer bitwise code runs at
+parity with V8. Method and numbers:
 [docs/benchmarks.md](docs/benchmarks.md).
 
 ## The bytecode VM
