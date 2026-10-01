@@ -79,11 +79,30 @@ assert_eq!(String::from_utf8(out).unwrap(), "3\n");
 Requires Node for the differential tests; the suite skips them gracefully
 when Node is absent.
 
+## Ownership inference
+
+Most code should need no annotations at all. `memjs::infer_report`
+classifies every unannotated fresh-value declaration:
+
+```rust
+let report = memjs::infer_report(src).unwrap();
+// [("buf", OwnAble), ("data", Gc(EscapesViaReturn)), ...]
+```
+
+A declaration is own-able when no return escapes it, no container
+stores it, no closure captures it, no aliasing shares it — and it is
+not used in arithmetic, which JavaScript would coerce silently.
+`memjs::run_inferred` applies those verdicts before running: qualifying
+declarations allocate into arenas, exactly as if they carried `// @own`.
+The Node differential covers inferred programs too — identical output to
+Node is the soundness oracle. The one documented v1 limit: ordinary
+calls are assumed to borrow only; a callee that writes through its
+parameter fails loudly at runtime rather than silently diverging.
+
 ## Status
 
 M1 (language + interpreter + transpiler), M2 (objects, `var`, `for..in`,
-correct `for`-`let` closures), and M3 (`@own`/`@ref` arenas with enforced
-moves and borrows) are complete. Next: annotation inference — most code
-should need no annotations at all.
+correct `for`-`let` closures), M3 (`@own`/`@ref` arenas with enforced
+moves and borrows), and M4 (ownership inference) are complete.
 
 License: MIT OR Apache-2.0.

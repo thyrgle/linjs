@@ -73,6 +73,41 @@ const FIXTURES: &[&str] = &[
     r#"for (const k in 42) { console.log(k); } console.log("done");"#,
 ];
 
+/// Programs whose fresh locals qualify for inference — the memjs side
+/// runs with ownership applied, and must still match Node byte for
+/// byte. This is the inference soundness oracle.
+const INFERRED_FIXTURES: &[&str] = &[
+    "let buf = [1, 2, 3]; buf[0] = 10; let sum = 0; for (const v of buf) { sum += v; } console.log(sum, buf.length);",
+    "let a = [1, 2]; let b = a; b.push(3); console.log(b[0], b[2]);",
+    "let a = [1]; let b = a; b[0] = 2; console.log(a[0], b[0]);",
+    "const point = { x: 1, y: 2 }; point.x = 5; console.log(point.x, point.y, point.z);",
+    "function make() { let fresh = [7, 8]; return fresh.length; } console.log(make());",
+    "function total(items) { let sum = 0; for (const v of items) { sum += v; } return sum; } let buf = [1, 2, 3]; console.log(total(buf), buf.length);",
+    "let nested = { outer: [1, 2] }; nested.outer.push(3); console.log(nested.outer.length, nested.outer[2]);",
+];
+
+#[test]
+fn inferred_interpreter_matches_node() {
+    let node_missing = match std::process::Command::new("node").arg("--version").output() {
+        Ok(out) => !out.status.success(),
+        Err(_) => true,
+    };
+    if node_missing {
+        eprintln!("skipping: node is not available");
+        return;
+    }
+    for (i, src) in INFERRED_FIXTURES.iter().enumerate() {
+        match memjs::check_inferred_against_node(src) {
+            Ok(()) => {}
+            Err(msg) if msg == "node not available" => {
+                eprintln!("skipping: node is not available");
+                return;
+            }
+            Err(msg) => panic!("inferred fixture {i} diverged: {msg}\nsource: {src}"),
+        }
+    }
+}
+
 #[test]
 fn interpreter_matches_node() {
     let node_missing = match std::process::Command::new("node").arg("--version").output() {

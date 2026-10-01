@@ -40,11 +40,16 @@
 //! programs are still 100% valid JavaScript, and the Node differential
 //! covers them too.
 //!
-//! Divergences from JavaScript are documented in [`interp`] and
-//! [`mem`]; the roadmap — annotation inference — is in the workspace
-//! README.
+//! And most code needs no annotations at all: [`infer`] classifies
+//! unannotated fresh-value declarations (own-able, or garbage-collected
+//! with the reason), and [`run_inferred`] applies the verdicts — the
+//! Node differential verifies inferred programs byte for byte.
+//!
+//! Divergences from JavaScript are documented in [`interp`], [`mem`],
+//! and [`infer`].
 
 pub mod ast;
+pub mod infer;
 pub mod interp;
 pub mod lexer;
 pub mod mem;
@@ -57,6 +62,54 @@ pub use ast::{Expr, Stmt};
 pub use interp::{Interp, InterpError, Item};
 pub use passes::{parse_program, program_from_tree, Ctx, ItemsPass, Settle};
 pub use transpile::transpile;
+
+/// Classifies the program's unannotated fresh-value declarations
+/// without running anything: `(name, verdict)` in declaration order.
+/// See [`infer`] for the rules.
+pub fn infer_report(source: &str) -> Result<infer::Inference, InterpError> {
+    let (mut items, _) = parse_program(source).map_err(|e| InterpError { message: e })?;
+    Ok(infer::infer(&mut items, false))
+}
+
+/// Parses, applies ownership inference, then runs: unannotated
+/// declarations that qualify allocate into arenas, exactly as if they
+/// carried `// @own`. Sound inference means the output matches
+/// [`run`] — and Node — byte for byte.
+pub fn run_inferred(
+    source: &str,
+    out: &mut dyn std::io::Write,
+) -> Result<Vec<(usize, String)>, InterpError> {
+    let (mut items, errors) = parse_program(source).map_err(|e| InterpError { message: e })?;
+    infer::infer(&mut items, true);
+    let mut interp = Interp::new(out);
+    interp.run(&items)?;
+    Ok(errors)
+}
+
+/// Like [`check_against_node`], but the memjs side runs with ownership
+/// inference applied — the soundness oracle: inferred programs must
+/// produce identical output to Node.
+pub fn check_inferred_against_node(source: &str) -> Result<(), String> {
+    let node = which_node().ok_or("node not available")?;
+    let mut ours = Vec::new();
+    run_inferred(source, &mut ours).map_err(|e| format!("memjs error: {}", e.message))?;
+    let ours = String::from_utf8(ours).map_err(|e| e.to_string())?;
+
+    let (items, _) = parse_program(source)?;
+    let js = transpile(&items);
+    let output = std::process::Command::new(node)
+        .arg("-e")
+        .arg(js)
+        .output()
+        .map_err(|e| format!("node failed to run: {e}"))?;
+    let theirs = String::from_utf8_lossy(&output.stdout).to_string();
+    if ours != theirs {
+        return Err(format!(
+            "outputs diverge (inferred):\n-- memjs --\n{ours}\n-- node --\n{theirs}"
+        ));
+    }
+    Ok(())
+}
 
 /// Parses and runs `source`, writing `console.log` output to `out`.
 ///
