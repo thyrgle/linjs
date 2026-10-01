@@ -379,7 +379,9 @@ impl<'o> Vm<'o> {
                 let lv = self.stack.pop().unwrap();
                 let result = match op {
                     EqOp::Strict => lv.strict_eq(&rv),
+                    EqOp::StrictNe => !lv.strict_eq(&rv),
                     EqOp::Loose => lv.loose_eq(&rv),
+                    EqOp::LooseNe => !lv.loose_eq(&rv),
                 };
                 self.stack.push(Value::Bool(result));
             }

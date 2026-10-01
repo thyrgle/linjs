@@ -498,9 +498,9 @@ impl<'s> Parser<'s> {
         loop {
             let op = match self.peek() {
                 Tok::EqStrict => EqOp::Strict,
-                Tok::NeStrict => EqOp::Strict,
+                Tok::NeStrict => EqOp::StrictNe,
                 Tok::Eq => EqOp::Loose,
-                Tok::Ne => EqOp::Loose,
+                Tok::Ne => EqOp::LooseNe,
                 _ => break,
             };
             self.bump();

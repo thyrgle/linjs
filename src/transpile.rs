@@ -286,7 +286,9 @@ fn expr_str(out: &mut String, expr: &Expr) {
             wrap(out, l, 4, expr);
             out.push_str(match op {
                 EqOp::Strict => " === ",
+                EqOp::StrictNe => " !== ",
                 EqOp::Loose => " == ",
+                EqOp::LooseNe => " != ",
             });
             wrap(out, r, 5, expr);
         }

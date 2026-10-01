@@ -92,6 +92,18 @@ lockstep with the tree-walking interpreter: identical outputs on every
 fixture, identical memory semantics, and byte-identical output against
 Node.
 
+## The WASM backend
+
+`memjs::compile_to_wasm` compiles the **strict dialect** — numbers,
+booleans, control flow, functions, and `// @own` arrays — to a real
+WebAssembly module. `@own` arrays live in linear memory, bump-allocated
+from a per-frame arena; the escape rules guarantee frame teardown is a
+pointer reset, so annotated code runs with **no garbage collector
+anywhere in the pipeline**. Unannotated arrays are a compile error: in
+linear memory there is nothing to fall back on. The differential
+harness instantiates the emitted module in Node and checks its output
+against the interpreter byte for byte.
+
 ## Ownership inference
 
 Most code should need no annotations at all. `memjs::infer_report`
@@ -116,8 +128,9 @@ parameter fails loudly at runtime rather than silently diverging.
 
 M1 (language + interpreter + transpiler), M2 (objects, `var`, `for..in`,
 correct `for`-`let` closures), M3 (`@own`/`@ref` arenas with enforced
-moves and borrows), M4 (ownership inference), and M5 (the bytecode VM)
-are complete. Next: a WASM backend — the VM's frame and cell layout
-transliterates to linear memory.
+moves and borrows), M4 (ownership inference), M5 (the bytecode VM), and
+M6 (the WASM backend for the strict dialect) are complete. Next:
+widening the strict dialect (object layouts, strings, methods) toward
+full-language WASM compilation.
 
 License: MIT OR Apache-2.0.

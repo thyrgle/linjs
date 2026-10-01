@@ -9,3 +9,8 @@ readme = "README.md"
 
 [dependencies]
 increparse = "0.1.0"
+wasm-encoder = "0.260.0"
+wasmparser = "0.260.0"
+
+[dev-dependencies]
+wasmparser = "0.260.0"

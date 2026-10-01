@@ -49,7 +49,10 @@
 //! [`vm::Vm`] executes it on an explicit stack machine — slot-based
 //! frames, cell-boxed closures, and arena teardown as part of frame
 //! return. [`run_vm`] runs it, and the differential binds it to the
-//! interpreter and Node.
+//! interpreter and Node. [`wasm`] goes further: the strict dialect
+//! compiles to a WebAssembly module whose `@own` arrays live in linear
+//! memory under a bump arena — validated with wasmparser and run in
+//! Node by the differential.
 //!
 //! Divergences from JavaScript are documented in [`interp`], [`mem`],
 //! [`infer`], and [`compile`].
@@ -65,6 +68,7 @@ pub mod passes;
 pub mod transpile;
 pub mod value;
 pub mod vm;
+pub mod wasm;
 
 pub use ast::{Expr, Stmt};
 pub use compile::{compile, Program};
@@ -116,6 +120,59 @@ pub fn check_inferred_against_node(source: &str) -> Result<(), String> {
     if ours != theirs {
         return Err(format!(
             "outputs diverge (inferred):\n-- memjs --\n{ours}\n-- node --\n{theirs}"
+        ));
+    }
+    Ok(())
+}
+
+/// Compiles the strict dialect to a WebAssembly module.
+///
+/// The strict dialect: numbers, booleans, control flow, functions with
+/// numeric parameters, and `// @own` arrays in linear memory. Returns
+/// the raw `.wasm` bytes — an exported `run()` function and `memory`,
+/// with `console.log(numeric)` bound to the `env.log` import.
+pub fn compile_to_wasm(source: &str) -> Result<Vec<u8>, wasm::WasmError> {
+    wasm::compile(source)
+}
+
+/// The full proof: the same program runs in the interpreter and as a
+/// compiled WebAssembly module in Node — the outputs must match byte
+/// for byte.
+pub fn check_wasm_against_node(source: &str) -> Result<(), String> {
+    let node = which_node().ok_or("node not available")?;
+    let bytes = compile_to_wasm(source).map_err(|e| e.message)?;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+    let mut ours = Vec::new();
+    run(source, &mut ours).map_err(|e| format!("memjs error: {}", e.message))?;
+    let ours = String::from_utf8(ours).map_err(|e| e.to_string())?;
+
+    let js = "const b = Buffer.from('".to_string()
+        + &hex
+        + "', 'hex');\n"
+        + "const env = new Proxy({}, { get: (t, name) => {\n"
+        + "  if (typeof name === 'string' && name.startsWith('log')) {\n"
+        + "    return (...xs) => console.log(...xs);\n"
+        + "  }\n"
+        + "  return undefined;\n"
+        + "} });\n"
+        + "WebAssembly.instantiate(b, { env })\n"
+        + ".then(r => r.instance.exports.run());";
+    let output = std::process::Command::new(node)
+        .arg("-e")
+        .arg(js)
+        .output()
+        .map_err(|e| format!("node failed to run: {e}"))?;
+    let theirs = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.stderr.is_empty() {
+        return Err(format!(
+            "wasm run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    if ours != theirs {
+        return Err(format!(
+            "outputs diverge (wasm):\n-- memjs --\n{ours}\n-- wasm --\n{theirs}"
         ));
     }
     Ok(())

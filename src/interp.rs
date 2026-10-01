@@ -411,7 +411,9 @@ impl<'o> Interp<'o> {
                 let rv = self.eval(env, r)?;
                 Ok(Value::Bool(match op {
                     EqOp::Strict => lv.strict_eq(&rv),
+                    EqOp::StrictNe => !lv.strict_eq(&rv),
                     EqOp::Loose => lv.loose_eq(&rv),
+                    EqOp::LooseNe => !lv.loose_eq(&rv),
                 }))
             }
             Expr::Ternary(cond, then, els) => {

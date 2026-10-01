@@ -37,11 +37,14 @@ pub enum LogicalOp {
     Or,
 }
 
-/// An equality operator. `==` performs JavaScript coercion; `===` is strict.
+/// An equality operator. `==` performs JavaScript coercion; `===` is
+/// strict; the `Ne` variants negate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EqOp {
     Loose,
+    LooseNe,
     Strict,
+    StrictNe,
 }
 
 /// `++` / `--`, prefix or postfix.
