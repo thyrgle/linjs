@@ -13,4 +13,10 @@ wasm-encoder = "0.260.0"
 wasmparser = "0.260.0"
 
 [dev-dependencies]
+boa_engine = "0.22.0"
+criterion = "0.8.2"
 wasmparser = "0.260.0"
+
+[[bench]]
+name = "engines"
+harness = false

@@ -808,6 +808,10 @@ impl<'s> Parser<'s> {
                         if !self.eat(&Tok::Comma) {
                             break;
                         }
+                        // A trailing comma before `}` is legal JavaScript.
+                        if matches!(self.peek(), Tok::RBrace) {
+                            break;
+                        }
                     }
                 }
                 self.expect(&Tok::RBrace)?;
@@ -820,6 +824,10 @@ impl<'s> Parser<'s> {
                     loop {
                         items.push(self.parse_assignment()?);
                         if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                        // A trailing comma before `]` is legal JavaScript.
+                        if matches!(self.peek(), Tok::RBracket) {
                             break;
                         }
                     }

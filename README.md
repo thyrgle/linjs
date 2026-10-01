@@ -79,6 +79,18 @@ assert_eq!(String::from_utf8(out).unwrap(), "3\n");
 Requires Node for the differential tests; the suite skips them gracefully
 when Node is absent.
 
+## Benchmarks
+
+The three engines are measured against V8 and Boa with a
+checksum-gated, methodology-first harness: kernel programs run
+identically on every engine, outputs must match before any number is
+reported, and V8 gets 2,000 warmup iterations so it is measured at its
+optimizing best. Headline: the compiled WASM beats V8 on
+call-heavy f64 code (~4x on fib), loses 1.2-3x on loop/array work,
+and — the point of the memory model — allocation latency is flat after
+one-time arena growth, with no GC pauses. Method and numbers:
+[docs/benchmarks.md](docs/benchmarks.md).
+
 ## The bytecode VM
 
 linjs compiles to bytecode and runs on an explicit stack machine
