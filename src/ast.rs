@@ -135,13 +135,13 @@ pub enum Stmt {
     /// applies to every declarator in the statement.
     Let {
         is_const: bool,
-        decls: Vec<(String, Option<Expr>)>,
+        decls: Vec<Declarator>,
         mem: Mem,
     },
     /// `var x = e, y;` — function-scoped and hoisted to the function
     /// frame (unlike `let`, which is block-scoped).
     Var {
-        decls: Vec<(String, Option<Expr>)>,
+        decls: Vec<Declarator>,
         mem: Mem,
     },
     Expr(Expr),
@@ -177,10 +177,62 @@ pub enum Stmt {
     Empty,
 }
 
+/// A parsed function head: name, params, body, declared return type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FnParts {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub body: Vec<Stmt>,
+    pub ret: Option<TypeAnn>,
+}
+
 /// A parsed top-level function.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDef {
     pub name: String,
-    pub params: Vec<String>,
+    pub params: Vec<Param>,
     pub body: Vec<Stmt>,
+    /// The declared return type, if any. Erased at runtime.
+    pub ret: Option<TypeAnn>,
+}
+
+/// One function parameter: a name plus an optional type annotation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub name: String,
+    pub ann: Option<TypeAnn>,
+}
+
+/// A type annotation: `number`, `string`, `boolean`, `any`, `T[]`.
+/// Purely static — parsed, checked, and erased at runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeAnn {
+    Num,
+    Str,
+    Bool,
+    /// The gradual escape hatch: compatible with everything.
+    Any,
+    Array(Box<TypeAnn>),
+}
+
+impl TypeAnn {
+    /// The source-level name (`"number[]"` for nested arrays).
+    pub fn name(&self) -> String {
+        match self {
+            TypeAnn::Num => "number".into(),
+            TypeAnn::Str => "string".into(),
+            TypeAnn::Bool => "boolean".into(),
+            TypeAnn::Any => "any".into(),
+            TypeAnn::Array(inner) => format!("{}[]", inner.name()),
+        }
+    }
+}
+
+/// One `let`/`const`/`var` declarator: name, optional type annotation,
+/// optional initializer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Declarator {
+    pub name: String,
+    pub ann: Option<TypeAnn>,
+    pub init: Option<Expr>,
 }

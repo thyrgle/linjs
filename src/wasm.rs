@@ -68,6 +68,23 @@ enum Ty {
 }
 
 impl Ty {
+    /// The dialect type of an annotation, if it has one. `any` has no
+    /// WASM representation: dynamic values need the GC engines.
+    fn from_ann(ann: &TypeAnn) -> Option<Ty> {
+        match ann {
+            TypeAnn::Num => Some(Ty::Num),
+            TypeAnn::Str => Some(Ty::Str),
+            TypeAnn::Bool => Some(Ty::Bool),
+            TypeAnn::Array(inner) => match &**inner {
+                TypeAnn::Num => Some(Ty::Arr),
+                _ => None,
+            },
+            TypeAnn::Any => None,
+        }
+    }
+}
+
+impl Ty {
     fn val(self) -> ValType {
         match self {
             Ty::Num => ValType::F64,
@@ -129,8 +146,8 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
         match stmt {
             Stmt::Expr(e) => visit_log_expr(e, max),
             Stmt::Let { decls, .. } | Stmt::Var { decls, .. } => {
-                for (_, init) in decls {
-                    if let Some(init) = init {
+                for d in decls {
+                    if let Some(init) = &d.init {
                         visit_log_expr(init, max);
                     }
                 }
@@ -450,8 +467,9 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
     // User functions.
     let mut fn_count = concat_idx + 1;
     for def in &user_fns {
+        let param_names: Vec<String> = def.params.iter().map(|p| p.name.clone()).collect();
         let mut c = FnCompiler::new(
-            &def.params,
+            &param_names,
             &signatures,
             alloc_idx,
             concat_idx,
@@ -666,17 +684,43 @@ impl<'s> FnCompiler<'s> {
                 is_const: _,
             }
             | Stmt::Var { decls, mem } => {
-                for (name, init) in decls {
-                    let ty = match init {
-                        Some(init) => {
-                            let ty = self.infer_expr(init)?;
-                            if ty == Ty::Arr && *mem != Mem::Own {
-                                return Err(needs_own());
+                for d in decls {
+                    // An explicit annotation decides the dialect type:
+                    // `any` is rejected (dynamic values need the GC
+                    // engines), and the concrete types override
+                    // inference.
+                    let ann_ty = match &d.ann {
+                        Some(ann) => match Ty::from_ann(ann) {
+                            Some(ty) => Some(ty),
+                            None => {
+                                return Err(self.err(
+                                    "`any` needs the dynamic engines — the WASM dialect requires concrete types",
+                                ))
                             }
-                            self.compile_expr(init, Some(ty))?;
-                            ty
-                        }
-                        None => Ty::Num,
+                        },
+                        None => None,
+                    };
+                    let (name, init) = (&d.name, &d.init);
+                    let ty = match init {
+                        Some(init) => match ann_ty {
+                            // The annotation decides: compile against
+                            // it directly.
+                            Some(t) => {
+                                self.compile_expr(init, Some(t))?;
+                                t
+                            }
+                            // Unannotated: infer, and require @own for
+                            // arrays.
+                            None => {
+                                let ty = self.infer_expr(init)?;
+                                if ty == Ty::Arr && *mem != Mem::Own {
+                                    return Err(needs_own());
+                                }
+                                self.compile_expr(init, Some(ty))?;
+                                ty
+                            }
+                        },
+                        None => ann_ty.unwrap_or(Ty::Num),
                     };
                     let idx = self.fresh(ty.val());
                     self.locals.insert(name.clone(), (idx, ty));
@@ -1435,8 +1479,8 @@ fn collect_str_literals(item: &Item, out: &mut Vec<String>) {
     fn walk_stmt(stmt: &Stmt, out: &mut Vec<String>) {
         match stmt {
             Stmt::Let { decls, .. } | Stmt::Var { decls, .. } => {
-                for (_, init) in decls {
-                    if let Some(init) = init {
+                for d in decls {
+                    if let Some(init) = &d.init {
                         walk_expr(init, out);
                     }
                 }

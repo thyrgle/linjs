@@ -41,6 +41,12 @@
 //! programs are still 100% valid JavaScript, and the Node differential
 //! covers them too.
 //!
+//! Types are layer two, orthogonal to memory: [`check`] implements
+//! TypeScript-style annotations (`number`, `string`, `boolean`, `any`,
+//! `T[]`) checked statically and erased at runtime — [`check_program`]
+//! returns every type error, and the WASM backend consumes the
+//! annotations as its valtypes.
+//!
 //! And most code needs no annotations at all: [`infer`] classifies
 //! unannotated fresh-value declarations (own-able, or garbage-collected
 //! with the reason), and [`run_inferred`] applies the verdicts — the
@@ -59,6 +65,7 @@
 //! [`infer`], and [`compile`].
 
 pub mod ast;
+pub mod check;
 pub mod compile;
 pub mod infer;
 pub mod interp;
@@ -124,6 +131,17 @@ pub fn check_inferred_against_node(source: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Typechecks `source` statically and returns every type error.
+///
+/// Annotations are TS-style: checked here, erased at runtime. Types
+/// never change what a program does — they change what mistakes it can
+/// make. The type language is `number`, `string`, `boolean`, `any`,
+/// and `T[]`; unannotated code is inferred, and `any` is compatible
+/// with everything.
+pub fn check_program(source: &str) -> Result<Vec<check::TypeError>, String> {
+    check::check_program(source)
 }
 
 /// Compiles the strict dialect to a WebAssembly module.

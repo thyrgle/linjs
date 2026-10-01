@@ -105,6 +105,28 @@ linear memory there is nothing to fall back on. The differential
 harness instantiates the emitted module in Node and checks its output
 against the interpreter byte for byte.
 
+## The type layer
+
+TypeScript-style annotations, checked statically and **erased at
+runtime** — typed and untyped programs run identically through every
+engine:
+
+```js
+function add(a: number, b: number): number { return a + b; }
+let x: number = add(2, 3);
+let anything: any = f();          // the gradual escape hatch
+let xs: number[] = [1, 2];        // pairs with // @own for WASM
+```
+
+`linjs::check_program` returns every type error; the type language is
+`number`, `string`, `boolean`, `any`, and `T[]`, with inference for
+unannotated code and `any` compatible in both directions. Types say
+*what* a value is, `@own` says *how long it lives* — and the WASM
+backend consumes both: annotated concrete types decide its valtypes,
+while `any` is rejected there (dynamic values need the GC engines).
+That is the whole thesis in one sentence: **typed + `@own` = compiled
+WASM, zero GC.**
+
 ## Ownership inference
 
 Most code should need no annotations at all. `linjs::infer_report`

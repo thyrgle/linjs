@@ -149,7 +149,7 @@ fn inference_flips_qualifying_declarations_to_own() {
         .iter()
         .filter_map(|item| match item {
             linjs::Item::Stmt(linjs::Stmt::Let { decls, mem, .. }) => {
-                Some(format!("{}:{mem:?}", decls[0].0))
+                Some(format!("{}:{mem:?}", decls[0].name))
             }
             _ => None,
         })

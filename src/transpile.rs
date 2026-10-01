@@ -14,9 +14,10 @@ pub fn transpile(items: &[Item]) -> String {
     for item in items {
         match item {
             Item::Fn(def) => {
+                let names: Vec<String> = def.params.iter().map(|p| p.name.clone()).collect();
                 out.push_str("function ");
                 out.push_str(&def.name);
-                out.push_str(&params_str(&def.params));
+                out.push_str(&params_str(&names));
                 out.push_str(" {\n");
                 for stmt in &def.body {
                     stmt_str(&mut out, stmt, 1);
@@ -47,12 +48,12 @@ fn stmt_str(out: &mut String, stmt: &Stmt, level: usize) {
             is_const, decls, ..
         } => {
             out.push_str(if *is_const { "const " } else { "let " });
-            for (i, (name, init)) in decls.iter().enumerate() {
+            for (i, d) in decls.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                out.push_str(name);
-                if let Some(init) = init {
+                out.push_str(&d.name);
+                if let Some(init) = &d.init {
                     out.push_str(" = ");
                     expr_str(out, init);
                 }
@@ -121,12 +122,12 @@ fn stmt_str(out: &mut String, stmt: &Stmt, level: usize) {
         }
         Stmt::Var { decls, .. } => {
             out.push_str("var ");
-            for (i, (name, init)) in decls.iter().enumerate() {
+            for (i, d) in decls.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                out.push_str(name);
-                if let Some(init) = init {
+                out.push_str(&d.name);
+                if let Some(init) = &d.init {
                     out.push_str(" = ");
                     expr_str(out, init);
                 }
@@ -197,12 +198,12 @@ fn stmt_inline(out: &mut String, stmt: &Stmt) {
             is_const, decls, ..
         } => {
             out.push_str(if *is_const { "const " } else { "let " });
-            for (i, (name, init)) in decls.iter().enumerate() {
+            for (i, d) in decls.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                out.push_str(name);
-                if let Some(init) = init {
+                out.push_str(&d.name);
+                if let Some(init) = &d.init {
                     out.push_str(" = ");
                     expr_str(out, init);
                 }

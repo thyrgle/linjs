@@ -355,8 +355,12 @@ impl<'s> Parser<'s> {
                 Ok(Stmt::Continue)
             }
             Tok::Function => {
-                let (name, params, body) = self.parse_fn_parts()?;
-                Ok(Stmt::FnDecl(name, params, body))
+                let parts = self.parse_fn_parts()?;
+                Ok(Stmt::FnDecl(
+                    parts.name,
+                    parts.params.into_iter().map(|p| p.name).collect(),
+                    parts.body,
+                ))
             }
             _ => {
                 let expr = self.parse_expr()?;
@@ -368,11 +372,18 @@ impl<'s> Parser<'s> {
 
     /// Parses the declarator list of `let`/`const`/`var` — no trailing
     /// semicolon. Shared by statement position and the `for` header.
-    fn parse_declarators(&mut self, is_const: bool) -> PResult<Vec<(String, Option<Expr>)>> {
+    /// Type annotations (`let x: number = ...`) are parsed and carried
+    /// on the declarator; they are erased at runtime.
+    fn parse_declarators(&mut self, is_const: bool) -> PResult<Vec<Declarator>> {
         self.bump(); // the keyword
         let mut decls = Vec::new();
         loop {
             let name = self.ident()?;
+            let ann = if self.eat(&Tok::Colon) {
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
             let init = if self.eat(&Tok::Assign) {
                 Some(self.parse_expr()?)
             } else {
@@ -381,12 +392,38 @@ impl<'s> Parser<'s> {
                 }
                 None
             };
-            decls.push((name, init));
+            decls.push(Declarator { name, ann, init });
             if !self.eat(&Tok::Comma) {
                 break;
             }
         }
         Ok(decls)
+    }
+
+    /// Parses a type annotation: `number`, `string`, `boolean`, `any`,
+    /// or `T[]` (any nesting of `[]`).
+    fn parse_type(&mut self) -> PResult<TypeAnn> {
+        let base = match self.peek() {
+            Tok::Ident(name) => match name.as_str() {
+                "number" => TypeAnn::Num,
+                "string" => TypeAnn::Str,
+                "boolean" => TypeAnn::Bool,
+                "any" => TypeAnn::Any,
+                other => {
+                    return Err(self.err(format!(
+                        "unknown type `{other}` (expected number, string, boolean, any, or T[])"
+                    )))
+                }
+            },
+            other => return Err(self.err(format!("expected a type, found {other:?}"))),
+        };
+        self.bump();
+        let mut ty = base;
+        while self.eat(&Tok::LBracket) {
+            self.expect(&Tok::RBracket)?;
+            ty = TypeAnn::Array(Box::new(ty));
+        }
+        Ok(ty)
     }
 
     pub fn parse_block(&mut self) -> PResult<Vec<Stmt>> {
@@ -402,25 +439,49 @@ impl<'s> Parser<'s> {
         Ok(stmts)
     }
 
-    fn parse_fn_parts(&mut self) -> PResult<(String, Vec<String>, Vec<Stmt>)> {
+    fn parse_fn_parts(&mut self) -> PResult<crate::ast::FnParts> {
         self.expect(&Tok::Function)?;
         let name = self.ident()?;
         let params = self.parse_params()?;
+        let ret = if self.eat(&Tok::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
         let body = self.parse_block()?;
-        Ok((name, params, body))
+        Ok(FnParts {
+            name,
+            params,
+            body,
+            ret,
+        })
     }
 
     pub fn parse_fn_decl(&mut self) -> PResult<(FnDef, usize)> {
-        let (name, params, body) = self.parse_fn_parts()?;
-        Ok((FnDef { name, params, body }, self.prev_end()))
+        let parts = self.parse_fn_parts()?;
+        Ok((
+            FnDef {
+                name: parts.name,
+                params: parts.params,
+                body: parts.body,
+                ret: parts.ret,
+            },
+            self.prev_end(),
+        ))
     }
 
-    fn parse_params(&mut self) -> PResult<Vec<String>> {
+    fn parse_params(&mut self) -> PResult<Vec<Param>> {
         self.expect(&Tok::LParen)?;
         let mut params = Vec::new();
         if !matches!(self.peek(), Tok::RParen) {
             loop {
-                params.push(self.ident()?);
+                let name = self.ident()?;
+                let ann = if self.eat(&Tok::Colon) {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                params.push(Param { name, ann });
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
@@ -685,23 +746,27 @@ impl<'s> Parser<'s> {
             Tok::LParen => {
                 // `(...) => ...` or a parenthesized expression.
                 if self.is_arrow_params()? {
-                    let params = {
+                    let params: Vec<String> = {
                         self.bump(); // (
-                        let params = if matches!(self.peek(), Tok::RParen) {
-                            Vec::new()
-                        } else {
-                            let mut out = Vec::new();
+                        let mut names = Vec::new();
+                        if !matches!(self.peek(), Tok::RParen) {
                             loop {
-                                out.push(self.ident()?);
+                                let name = self.ident()?;
+                                // Typed arrow params: `(a: number) =>`.
+                                // Annotations are erased; only the name
+                                // reaches the expression tree.
+                                if self.eat(&Tok::Colon) {
+                                    self.parse_type()?;
+                                }
+                                names.push(name);
                                 if !self.eat(&Tok::Comma) {
                                     break;
                                 }
                             }
-                            out
-                        };
+                        }
                         self.expect(&Tok::RParen)?;
                         self.expect(&Tok::Arrow)?;
-                        params
+                        names
                     };
                     return self.parse_arrow_body(params);
                 }
@@ -774,7 +839,11 @@ impl<'s> Parser<'s> {
                 };
                 let params = self.parse_params()?;
                 let body = self.parse_block()?;
-                Ok(Expr::Fn(name, params, body))
+                Ok(Expr::Fn(
+                    name,
+                    params.into_iter().map(|p| p.name).collect(),
+                    body,
+                ))
             }
             other => Err(self.err(format!("unexpected token {other:?}"))),
         }

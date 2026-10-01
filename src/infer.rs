@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{Expr, Mem, Stmt, Target};
+use crate::ast::{Declarator, Expr, Mem, Stmt, Target};
 use crate::interp::Item;
 
 /// Why a declaration cannot be `@own`.
@@ -151,19 +151,20 @@ impl Scope {
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut moves_from = HashMap::new();
         for stmt in stmts {
-            let (mem, decls): (Mem, &Vec<(String, Option<Expr>)>) = match stmt {
+            let (mem, decls): (Mem, &Vec<Declarator>) = match stmt {
                 Stmt::Let { mem, decls, .. } => (*mem, decls),
                 Stmt::Var { mem, decls } => (*mem, decls),
                 _ => continue,
             };
             if mem != Mem::Gc {
                 // Explicitly annotated declarations are not candidates.
-                for (name, _) in decls {
-                    moves_from.remove(name);
+                for d in decls {
+                    moves_from.remove(&d.name);
                 }
                 continue;
             }
-            for (name, init) in decls {
+            for d in decls {
+                let (name, init) = (&d.name, &d.init);
                 match init.as_ref() {
                     Some(Expr::Array(_) | Expr::Obj(_)) => {
                         candidates.push(Candidate {
@@ -342,8 +343,8 @@ fn single_decl(stmt: &Stmt) -> Option<(&String, &Option<Expr>)> {
         _ => return None,
     };
     if decls.len() == 1 {
-        let (name, init) = &decls[0];
-        Some((name, init))
+        let d = &decls[0];
+        Some((&d.name, &d.init))
     } else {
         None
     }
@@ -452,8 +453,8 @@ fn walk_stmt(stmt: &Stmt, f: &mut impl FnMut(&Expr)) {
 fn collect_walk_stmt(stmt: &Stmt, f: &mut impl FnMut(&Expr)) {
     match stmt {
         Stmt::Let { decls, .. } | Stmt::Var { decls, .. } => {
-            for (_, init) in decls {
-                if let Some(init) = init {
+            for d in decls {
+                if let Some(init) = &d.init {
                     collect_walk_expr(init, f);
                 }
             }
@@ -552,8 +553,8 @@ fn expr_mentions(expr: &Expr, name: &str) -> bool {
 pub fn collect_uses(stmt: &Stmt, out: &mut impl FnMut(&str)) {
     match stmt {
         Stmt::Let { decls, .. } | Stmt::Var { decls, .. } => {
-            for (_, init) in decls {
-                if let Some(init) = init {
+            for d in decls {
+                if let Some(init) = &d.init {
                     collect_uses_expr(init, out);
                 }
             }
@@ -653,7 +654,7 @@ fn apply_body(body: &mut [Stmt], owned: &[String]) {
 fn apply_body_stmt(stmt: &mut Stmt, owned: &[String]) {
     match stmt {
         Stmt::Let { decls, mem, .. } | Stmt::Var { decls, mem } => {
-            let qualifies = *mem == Mem::Gc && decls.len() == 1 && owned.contains(&decls[0].0);
+            let qualifies = *mem == Mem::Gc && decls.len() == 1 && owned.contains(&decls[0].name);
             if qualifies {
                 *mem = Mem::Own;
             }

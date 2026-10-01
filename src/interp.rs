@@ -88,7 +88,7 @@ impl<'o> Interp<'o> {
                     &def.name,
                     self.closure(
                         Some(def.name.clone()),
-                        def.params.clone(),
+                        def.params.iter().map(|p| p.name.clone()).collect(),
                         &def.body,
                         &global,
                     ),
@@ -160,16 +160,16 @@ impl<'o> Interp<'o> {
                 decls,
                 mem,
             } => {
-                for (name, init) in decls {
-                    let value = self.eval_decl(env, *mem, init, name)?;
-                    env.declare(name, value, *is_const);
+                for d in decls {
+                    let value = self.eval_decl(env, *mem, &d.init, &d.name)?;
+                    env.declare(&d.name, value, *is_const);
                 }
                 Ok(Ctl::Val)
             }
             Stmt::Var { decls, mem } => {
-                for (name, init) in decls {
-                    let value = self.eval_decl(env, *mem, init, name)?;
-                    set_var(env, name, value);
+                for d in decls {
+                    let value = self.eval_decl(env, *mem, &d.init, &d.name)?;
+                    set_var(env, &d.name, value);
                 }
                 Ok(Ctl::Val)
             }
@@ -211,9 +211,7 @@ impl<'o> Interp<'o> {
                 // as JavaScript specifies. `var` bindings live in the
                 // function frame and are shared.
                 let let_names: Vec<String> = match init.as_deref() {
-                    Some(Stmt::Let { decls, .. }) => {
-                        decls.iter().map(|(name, _)| name.clone()).collect()
-                    }
+                    Some(Stmt::Let { decls, .. }) => decls.iter().map(|d| d.name.clone()).collect(),
                     _ => Vec::new(),
                 };
                 loop {
@@ -805,9 +803,9 @@ impl<'o> Interp<'o> {
 fn hoist_vars(frame: &Rc<Env>, stmt: &Stmt) {
     match stmt {
         Stmt::Var { decls, .. } => {
-            for (name, _) in decls {
-                if !frame.declares_locally(name) {
-                    frame.declare(name, Value::Undefined, false);
+            for d in decls {
+                if !frame.declares_locally(&d.name) {
+                    frame.declare(&d.name, Value::Undefined, false);
                 }
             }
         }

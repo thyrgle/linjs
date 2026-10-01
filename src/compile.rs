@@ -280,8 +280,9 @@ pub fn compile(items: &[Item]) -> Result<Program, CompileError> {
         if let Item::Fn(def) = item {
             // The function's free variables are exactly what it will
             // capture from main's frame.
+            let param_names: Vec<String> = def.params.iter().map(|p| p.name.clone()).collect();
             main.captured
-                .extend(free_vars(&def.params, &FnBody::Block(def.body.clone())));
+                .extend(free_vars(&param_names, &FnBody::Block(def.body.clone())));
         }
     }
     // Top-level function names live in the global table — references
@@ -301,9 +302,10 @@ pub fn compile(items: &[Item]) -> Result<Program, CompileError> {
     // statement runs.
     for item in items {
         if let Item::Fn(def) = item {
+            let param_names: Vec<String> = def.params.iter().map(|p| p.name.clone()).collect();
             main.compile_nested(
                 Some(&def.name),
-                &def.params,
+                &param_names,
                 &FnBody::Block(def.body.clone()),
             )?;
             let name_idx = main.str_const(&def.name);
@@ -586,7 +588,8 @@ impl FnCompiler {
                 is_const,
                 ..
             } => {
-                for (name, init) in decls {
+                for d in decls {
+                    let (name, init) = (&d.name, &d.init);
                     let slot = self.declare(name, *mem, *is_const);
                     match init {
                         Some(init) => {
@@ -631,7 +634,8 @@ impl FnCompiler {
                 }
             }
             Stmt::Var { decls, mem } => {
-                for (name, init) in decls {
+                for d in decls {
+                    let (name, init) = (&d.name, &d.init);
                     // `var` is function-scoped: reuse the function
                     // frame's slot if the name is already there.
                     let slot = if let Some(slot) = self.scopes[0].names.get(name) {
@@ -735,14 +739,14 @@ impl FnCompiler {
                         decls,
                         mem: Mem::Gc,
                         ..
-                    }) => decls.len() == 1 && self.captured.contains(&decls[0].0),
+                    }) => decls.len() == 1 && self.captured.contains(&decls[0].name),
                     _ => false,
                 };
                 if captured_for_let {
                     // Force-plain control slot, then re-declare the name
                     // as the body's per-iteration cell.
                     let name = match init.as_deref() {
-                        Some(Stmt::Let { decls, .. }) => decls[0].0.clone(),
+                        Some(Stmt::Let { decls, .. }) => decls[0].name.clone(),
                         _ => unreachable!(),
                     };
                     let control = {
@@ -904,8 +908,8 @@ impl FnCompiler {
     /// slots (the control-slot path skips normal declaration).
     fn compile_init_values(&mut self, init: &Stmt, slots: &[Slot]) -> CResult {
         if let Stmt::Let { decls, .. } = init {
-            for ((name, init_expr), slot) in decls.iter().zip(slots) {
-                let _ = name;
+            for (d, slot) in decls.iter().zip(slots) {
+                let init_expr = &d.init;
                 match init_expr {
                     Some(expr) => self.compile_expr(expr)?,
                     None => {
@@ -1395,8 +1399,8 @@ fn free_vars(params: &[String], body: &FnBody) -> HashSet<String> {
 fn collect_declared_deep(stmt: &Stmt, out: &mut HashSet<String>) {
     match stmt {
         Stmt::Let { decls, .. } | Stmt::Var { decls, .. } => {
-            for (name, _) in decls {
-                out.insert(name.clone());
+            for d in decls {
+                out.insert(d.name.clone());
             }
         }
         Stmt::FnDecl(name, ..) => {
@@ -1442,8 +1446,8 @@ fn all_nested_captures(stmts: &[Stmt]) -> HashSet<String> {
 fn collect_nested_captures_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
     match stmt {
         Stmt::Let { decls, .. } | Stmt::Var { decls, .. } => {
-            for (_, init) in decls {
-                if let Some(init) = init {
+            for d in decls {
+                if let Some(init) = &d.init {
                     collect_nested_captures_expr(init, out);
                 }
             }
@@ -1560,9 +1564,9 @@ fn collect_nested_captures_target(target: &Target, out: &mut HashSet<String>) {
 fn collect_all_refs(stmt: &Stmt, out: &mut HashSet<String>) {
     match stmt {
         Stmt::Let { decls, .. } | Stmt::Var { decls, .. } => {
-            for (name, init) in decls {
-                out.insert(name.clone());
-                if let Some(init) = init {
+            for d in decls {
+                out.insert(d.name.clone());
+                if let Some(init) = &d.init {
                     collect_all_refs_expr(init, out);
                 }
             }
@@ -1681,8 +1685,8 @@ fn collect_target_refs(target: &Target, out: &mut HashSet<String>) {
 fn collect_var_names(stmt: &Stmt, out: &mut HashSet<String>) {
     match stmt {
         Stmt::Var { decls, .. } => {
-            for (name, _) in decls {
-                out.insert(name.clone());
+            for d in decls {
+                out.insert(d.name.clone());
             }
         }
         Stmt::Let { .. } | Stmt::FnDecl(..) => {}
