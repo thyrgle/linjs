@@ -405,13 +405,24 @@ impl<'s> Parser<'s> {
     fn parse_type(&mut self) -> PResult<TypeAnn> {
         let base = match self.peek() {
             Tok::Ident(name) => match name.as_str() {
-                "number" => TypeAnn::Num,
+                "number" | "f64" => TypeAnn::Num,
                 "string" => TypeAnn::Str,
                 "boolean" => TypeAnn::Bool,
                 "any" => TypeAnn::Any,
+                "i8" => TypeAnn::I8,
+                "u8" => TypeAnn::U8,
+                "i16" => TypeAnn::I16,
+                "u16" => TypeAnn::U16,
+                "i32" => TypeAnn::I32,
+                "u32" => TypeAnn::U32,
+                "i64" => TypeAnn::I64,
+                "u64" => TypeAnn::U64,
+                "f32" => TypeAnn::F32,
+                "usize" => TypeAnn::Usize,
+                "isize" => TypeAnn::Isize,
                 other => {
                     return Err(self.err(format!(
-                        "unknown type `{other}` (expected number, string, boolean, any, or T[])"
+                        "unknown type `{other}` (expected number, string, boolean, any, i32..i64, u8..u64, f32, or T[])"
                     )))
                 }
             },
@@ -571,8 +582,56 @@ impl<'s> Parser<'s> {
         Ok(lhs)
     }
 
-    fn parse_comparison(&mut self) -> PResult<Expr> {
+    /// Shifts bind tighter than relational comparisons (JS precedence).
+    fn parse_shift(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_bit_and()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Shl => BitOp::Shl,
+                Tok::Shr => BitOp::Shr,
+                Tok::UShr => BitOp::UShr,
+                _ => return Ok(lhs),
+            };
+            self.bump();
+            let rhs = self.parse_bit_and()?;
+            lhs = Expr::Bit(op, Box::new(lhs), Box::new(rhs));
+        }
+    }
+
+    fn parse_bit_and(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_bit_xor()?;
+        while self.peek() == &Tok::Amp {
+            self.bump();
+            let rhs = self.parse_bit_xor()?;
+            lhs = Expr::Bit(BitOp::And, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bit_xor(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_bit_or()?;
+        while self.peek() == &Tok::Caret {
+            self.bump();
+            let rhs = self.parse_bit_or()?;
+            lhs = Expr::Bit(BitOp::Xor, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bit_or(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_additive()?;
+        loop {
+            if self.peek() != &Tok::Pipe {
+                return Ok(lhs);
+            }
+            self.bump();
+            let rhs = self.parse_additive()?;
+            lhs = Expr::Bit(BitOp::Or, Box::new(lhs), Box::new(rhs));
+        }
+    }
+
+    fn parse_comparison(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_shift()?;
         loop {
             let op = match self.peek() {
                 Tok::Lt => BinOp::Lt,
@@ -676,6 +735,21 @@ impl<'s> Parser<'s> {
                         .ok_or_else(|| self.err("invalid update target".into()))?;
                     self.bump();
                     expr = Expr::Update(upd, false, target);
+                }
+                Tok::As => {
+                    // Rust-style cast: `expr as i32`. Binds tighter than
+                    // binary operators (parenthesize compound LHS).
+                    self.bump();
+                    let ann = self.parse_type()?;
+                    expr = Expr::AsCast(crate::ast::AsCast {
+                        expr: Box::new(expr),
+                        ann,
+                    });
+                }
+                Tok::Tilde => {
+                    self.bump();
+                    let inner = self.parse_postfix()?;
+                    expr = Expr::BitNot(Box::new(inner));
                 }
                 _ => break,
             }

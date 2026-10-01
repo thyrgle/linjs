@@ -139,6 +139,17 @@ while `any` is rejected there (dynamic values need the GC engines).
 That is the whole thesis in one sentence: **typed + `@own` = compiled
 WASM, zero GC.**
 
+## Rust-style numeric types
+
+The dialect types are Rust's own: `i8`-`i64`, `u8`-`u64`, `f32`, `f64`
+(`number` is the `f64` alias, so all JS-flavored code keeps working).
+Integer annotations get real valtypes in the WASM dialect — wrapping
+i32 arithmetic, trapping division, half-memory arrays — and Rust-style
+casts (`x as i32`) emit trunc/convert/wrap there, while erasing to
+identity in the dynamic engines. Bitwise and shift operators
+(`& | ^ ~ << >> >>>`) carry JavaScript's i32 semantics, verified
+against Node. Divergences are documented in the crate docs.
+
 ## Ownership inference
 
 Most code should need no annotations at all. `linjs::infer_report`

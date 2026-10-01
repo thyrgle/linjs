@@ -266,6 +266,28 @@ fn expr_str(out: &mut String, expr: &Expr) {
             });
             wrap(out, e, 9, expr);
         }
+        Expr::Bit(op, l, r) => {
+            wrap(out, l, 1, expr);
+            out.push(' ');
+            out.push_str(match op {
+                BitOp::And => "&",
+                BitOp::Or => "|",
+                BitOp::Xor => "^",
+                BitOp::Shl => "<<",
+                BitOp::Shr => ">>",
+                BitOp::UShr => ">>>",
+            });
+            out.push(' ');
+            wrap(out, r, 2, expr);
+        }
+        Expr::BitNot(e) => {
+            out.push('~');
+            wrap(out, e, 9, expr);
+        }
+        Expr::AsCast(cast) => {
+            // Erased at runtime: identity in the dynamic engines.
+            expr_str(out, &cast.expr);
+        }
         Expr::Binary(op, l, r) => {
             let prec = bin_prec(op);
             wrap(out, l, prec, expr);
@@ -450,6 +472,9 @@ fn expr_prec(e: &Expr) -> Option<u8> {
         | Expr::Obj(_) => Some(20),
         Expr::Index(..) | Expr::Member(..) | Expr::Call(..) => Some(17),
         Expr::Unary(..) => Some(9),
+        Expr::Bit(..) => Some(1),
+        Expr::BitNot(..) => Some(9),
+        Expr::AsCast(..) => None,
         Expr::Binary(op, ..) => Some(bin_prec(op)),
         Expr::Logical(..) => Some(2),
         Expr::Eq(..) => Some(4),

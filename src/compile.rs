@@ -118,6 +118,13 @@ pub enum Op {
     MemberSet(u32),
     Bin(BinOp),
     Eq(EqOp),
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    UShr,
+    BitNot,
     Not,
     Neg,
     Typeof,
@@ -1018,6 +1025,26 @@ impl FnCompiler {
                     count: entries.len() as u16,
                     first_key: key_base,
                 });
+            }
+            Expr::Bit(op, l, r) => {
+                self.compile_expr(l)?;
+                self.compile_expr(r)?;
+                self.emit(match op {
+                    BitOp::And => Op::BitAnd,
+                    BitOp::Or => Op::BitOr,
+                    BitOp::Xor => Op::BitXor,
+                    BitOp::Shl => Op::Shl,
+                    BitOp::Shr => Op::Shr,
+                    BitOp::UShr => Op::UShr,
+                });
+            }
+            Expr::BitNot(e) => {
+                self.compile_expr(e)?;
+                self.emit(Op::BitNot);
+            }
+            Expr::AsCast(cast) => {
+                // Erased at runtime — identity in the dynamic engines.
+                self.compile_expr(&cast.expr)?;
             }
             Expr::Unary(op, e) => {
                 self.compile_expr(e)?;

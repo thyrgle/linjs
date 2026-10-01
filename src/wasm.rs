@@ -61,10 +61,51 @@ fn needs_own() -> WasmError {
 /// The static types of the strict dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ty {
+    /// `number` / `f64` — the JS-compatible default.
     Num,
     Bool,
+    /// `f64[]` — f64 elements, 8-byte stride.
     Arr,
+    /// `i32[]` / `u32[]` — i32 elements, 4-byte stride.
+    ArrI32,
     Str,
+    I32,
+    U32,
+    I64,
+    U64,
+    F32,
+}
+
+impl Ty {
+    /// Whether the type is one of the integer types bitwise ops
+    /// require.
+    fn is_int(self) -> bool {
+        matches!(self, Ty::I32 | Ty::U32 | Ty::I64 | Ty::U64)
+    }
+
+    /// For UShr result typing: unsigned shift yields the unsigned
+    /// variant when available.
+    fn max_int(self, other: Ty) -> Ty {
+        let _ = other;
+        match self {
+            Ty::I32 | Ty::Num => Ty::I32,
+            Ty::U32 => Ty::U32,
+            Ty::I64 => Ty::I64,
+            Ty::U64 => Ty::U64,
+            other => other,
+        }
+    }
+
+    /// The element size in linear memory for arrays of this type
+    /// (only Num/`f64` and I32 arrays exist in v1).
+    #[allow(dead_code)]
+    fn elem_size(self) -> Option<u64> {
+        match self {
+            Ty::Num => Some(8),
+            Ty::I32 | Ty::U32 => Some(4),
+            _ => None,
+        }
+    }
 }
 
 impl Ty {
@@ -75,8 +116,20 @@ impl Ty {
             TypeAnn::Num => Some(Ty::Num),
             TypeAnn::Str => Some(Ty::Str),
             TypeAnn::Bool => Some(Ty::Bool),
+            TypeAnn::I8 | TypeAnn::U8 | TypeAnn::I16 | TypeAnn::U16 | TypeAnn::I32 => Some(Ty::I32),
+            TypeAnn::U32 => Some(Ty::U32),
+            TypeAnn::I64 => Some(Ty::I64),
+            TypeAnn::U64 => Some(Ty::U64),
+            TypeAnn::F32 => Some(Ty::F32),
+            TypeAnn::Usize | TypeAnn::Isize => Some(Ty::I32),
             TypeAnn::Array(inner) => match &**inner {
                 TypeAnn::Num => Some(Ty::Arr),
+                TypeAnn::I8
+                | TypeAnn::U8
+                | TypeAnn::I16
+                | TypeAnn::U16
+                | TypeAnn::I32
+                | TypeAnn::U32 => Some(Ty::ArrI32),
                 _ => None,
             },
             TypeAnn::Any => None,
@@ -88,13 +141,17 @@ impl Ty {
     fn val(self) -> ValType {
         match self {
             Ty::Num => ValType::F64,
-            Ty::Bool | Ty::Arr | Ty::Str => ValType::I32,
+            Ty::F32 => ValType::F32,
+            Ty::I64 | Ty::U64 => ValType::I64,
+            Ty::Bool | Ty::Arr | Ty::ArrI32 | Ty::Str | Ty::I32 | Ty::U32 => ValType::I32,
         }
     }
 
     fn zero(self) -> Ins<'static> {
         match self {
             Ty::Num => Ins::F64Const((0.0).into()),
+            Ty::F32 => Ins::F32Const((0.0).into()),
+            Ty::I64 | Ty::U64 => Ins::I64Const(0),
             _ => Ins::I32Const(0),
         }
     }
@@ -651,6 +708,37 @@ impl<'s> FnCompiler<'s> {
         }
     }
 
+    /// Emits the conversion sequence for a numeric `as` cast. Same-type
+    /// casts are no-ops.
+    fn emit_cast(&mut self, from: Ty, to: Ty) {
+        use Ty::{F32, I32, I64, U32, U64};
+        match (from, to) {
+            (a, b) if a == b => {}
+            // To i32
+            (Ty::Num, I32) | (Ty::Num, U32) => self.emit(Ins::I32TruncF64S),
+            (F32, I32) | (F32, U32) => self.emit(Ins::I32TruncF32S),
+            (I64, I32) | (I64, U32) => self.emit(Ins::I32WrapI64),
+            (U64, I32) | (U64, U32) => self.emit(Ins::I32WrapI64),
+            // To u32 (zero-extend from i32 where relevant)
+            (I32, U32) => {}
+            // To i64 / u64
+            (I32, I64) => self.emit(Ins::I64ExtendI32S),
+            (I32, U64) | (U32, I64) | (U32, U64) => self.emit(Ins::I64ExtendI32U),
+            (Ty::Num, I64) | (Ty::Num, U64) => self.emit(Ins::I64TruncF64S),
+            (F32, I64) | (F32, U64) => self.emit(Ins::I64TruncF32S),
+            (I64, U64) => {}
+            // To f64
+            (I32, Ty::Num) | (U32, Ty::Num) => self.emit(Ins::F64ConvertI32S),
+            (I64, Ty::Num) | (U64, Ty::Num) => self.emit(Ins::F64ConvertI64S),
+            (F32, Ty::Num) => self.emit(Ins::F64PromoteF32),
+            // To f32
+            (Ty::Num, F32) => self.emit(Ins::F32DemoteF64),
+            (I32, F32) | (U32, F32) => self.emit(Ins::F32ConvertI32S),
+            (I64, F32) | (U64, F32) => self.emit(Ins::F32ConvertI64S),
+            _ => {}
+        }
+    }
+
     fn fresh(&mut self, vt: ValType) -> u32 {
         let idx = self.next_local;
         self.next_local += 1;
@@ -934,6 +1022,38 @@ impl<'s> FnCompiler<'s> {
             Expr::Num(_) => Ty::Num,
             Expr::Bool(_) => Ty::Bool,
             Expr::Array(_) => Ty::Arr,
+            Expr::Str(_) => Ty::Str,
+            Expr::Bit(op, l, r) => {
+                // Bitwise ops require integer operands (literals adapt:
+                // a Num operand reads as i32 in a bitwise context).
+                let lt = match self.infer_expr(l)? {
+                    Ty::Num => Ty::I32,
+                    other => other,
+                };
+                let rt = match self.infer_expr(r)? {
+                    Ty::Num => Ty::I32,
+                    other => other,
+                };
+                if !lt.is_int() || !rt.is_int() || lt != rt {
+                    return Err(self.err(
+                        "bitwise operators require matching integer operands (i32/u32/i64/u64)",
+                    ));
+                }
+                match op {
+                    BitOp::UShr => Ty::U32.max_int(lt),
+                    _ => lt,
+                }
+            }
+            Expr::BitNot(e) => match self.infer_expr(e)? {
+                Ty::Num => Ty::I32,
+                ty if ty.is_int() => ty,
+                _ => return Err(self.err("bitwise not requires an integer operand")),
+            },
+            Expr::AsCast(cast) => {
+                self.infer_expr(&cast.expr)?;
+                Ty::from_ann(&cast.ann)
+                    .ok_or_else(|| self.err(&format!("cannot cast to `{}`", cast.ann.name())))?
+            }
             Expr::Ident(name) => self
                 .locals
                 .get(name)
@@ -1056,7 +1176,6 @@ impl<'s> FnCompiler<'s> {
             Expr::Update(_, _, Target::Ident(_)) => Ty::Num,
             Expr::Update(..) => return Err(self.err("++/-- on non-locals")),
             Expr::Arrow(..) | Expr::Fn(..) => return Err(self.err("closures")),
-            Expr::Str(_) => Ty::Str,
             Expr::Obj(_) => return Err(self.err("objects")),
             Expr::Null | Expr::Undefined => return Err(self.err("null/undefined")),
         })
@@ -1081,6 +1200,31 @@ impl<'s> FnCompiler<'s> {
                         self.compile_expr(expr, None)?;
                         self.emit(Ins::F64ConvertI32U);
                         return Ok(Ty::Num);
+                    }
+                    // An integral literal adapts to the expected integer
+                    // or half-width float type (`let x: i32 = 5`).
+                    (Ty::Num, Ty::I32) | (Ty::Num, Ty::U32) if matches!(expr, Expr::Num(n) if n.fract() == 0.0 && *n >= i32::MIN as f64 && *n <= u32::MAX as f64) =>
+                    {
+                        let v = match expr {
+                            Expr::Num(n) => *n as i32,
+                            _ => unreachable!(),
+                        };
+                        self.emit(Ins::I32Const(v));
+                        return Ok(expect);
+                    }
+                    (Ty::Num, Ty::I64) | (Ty::Num, Ty::U64) if matches!(expr, Expr::Num(n) if n.fract() == 0.0) =>
+                    {
+                        let v = match expr {
+                            Expr::Num(n) => *n as i64,
+                            _ => unreachable!(),
+                        };
+                        self.emit(Ins::I64Const(v));
+                        return Ok(expect);
+                    }
+                    (Ty::Num, Ty::F32) if matches!(expr, Expr::Num(_)) => {
+                        self.compile_expr(expr, Some(Ty::Num))?;
+                        self.emit(Ins::F32DemoteF64);
+                        return Ok(Ty::F32);
                     }
                     _ => return Err(self.err(&format!("expected {expect:?}, found {ty:?}"))),
                 }
@@ -1173,6 +1317,57 @@ impl<'s> FnCompiler<'s> {
                 if matches!(op, EqOp::LooseNe | EqOp::StrictNe) {
                     self.emit(Ins::I32Eqz);
                 }
+            }
+            Expr::Bit(op, l, r) => {
+                let lt = match self.infer_expr(l)? {
+                    Ty::Num => Ty::I32,
+                    other => other,
+                };
+                self.compile_expr(l, Some(lt))?;
+                self.compile_expr(r, Some(lt))?;
+                match (lt, op) {
+                    (Ty::I32 | Ty::U32, BitOp::And) => self.emit(Ins::I32And),
+                    (Ty::I32 | Ty::U32, BitOp::Or) => self.emit(Ins::I32Or),
+                    (Ty::I32 | Ty::U32, BitOp::Xor) => self.emit(Ins::I32Xor),
+                    (Ty::I32 | Ty::U32, BitOp::Shl) => self.emit(Ins::I32Shl),
+                    (Ty::I32, BitOp::Shr) => self.emit(Ins::I32ShrS),
+                    (Ty::U32, BitOp::Shr) => self.emit(Ins::I32ShrU),
+                    (Ty::I32 | Ty::U32, BitOp::UShr) => self.emit(Ins::I32ShrU),
+                    (Ty::I64 | Ty::U64, BitOp::And) => self.emit(Ins::I64And),
+                    (Ty::I64 | Ty::U64, BitOp::Or) => self.emit(Ins::I64Or),
+                    (Ty::I64 | Ty::U64, BitOp::Xor) => self.emit(Ins::I64Xor),
+                    (Ty::I64 | Ty::U64, BitOp::Shl) => self.emit(Ins::I64Shl),
+                    (Ty::I64, BitOp::Shr) => self.emit(Ins::I64ShrS),
+                    (Ty::U64, BitOp::Shr) => self.emit(Ins::I64ShrU),
+                    (Ty::I64 | Ty::U64, BitOp::UShr) => self.emit(Ins::I64ShrU),
+                    (ty, _) => {
+                        return Err(self.err(&format!(
+                            "bitwise operators require integer operands, found {ty:?}"
+                        )))
+                    }
+                }
+            }
+            Expr::BitNot(e) => {
+                let ty = self.infer_expr(e)?;
+                self.compile_expr(e, Some(ty))?;
+                match ty {
+                    Ty::I32 | Ty::U32 => {
+                        self.emit(Ins::I32Const(-1));
+                        self.emit(Ins::I32Xor);
+                    }
+                    Ty::I64 | Ty::U64 => {
+                        self.emit(Ins::I64Const(-1));
+                        self.emit(Ins::I64Xor);
+                    }
+                    _ => return Err(self.err("bitwise not requires an integer operand")),
+                }
+            }
+            Expr::AsCast(cast) => {
+                let from = self.infer_expr(&cast.expr)?;
+                let to = Ty::from_ann(&cast.ann)
+                    .ok_or_else(|| self.err(&format!("cannot cast to `{}`", cast.ann.name())))?;
+                self.compile_expr(&cast.expr, Some(from))?;
+                self.emit_cast(from, to);
             }
             Expr::Logical(op, l, r) => {
                 // `a && b` returns b when a is truthy, else a; `||`
@@ -1319,14 +1514,24 @@ impl<'s> FnCompiler<'s> {
                 // console.log: all-numeric args go to log1..logN; a
                 // single string goes to logstr (the host decodes it
                 // from linear memory). Mixed calls are a v1 error.
+                // Integer-typed args coerce to f64 at the log boundary.
                 if let Expr::Member(obj_expr, prop) = &**callee {
                     if matches!(**obj_expr, Expr::Ident(ref n) if n == "console") && prop == "log" {
                         let mut all_num = true;
                         let mut all_str = true;
+                        let mut int_tys: Vec<Ty> = Vec::new();
                         for a in args {
                             match self.infer_expr(a)? {
                                 Ty::Num => all_str = false,
                                 Ty::Str => all_num = false,
+                                ty if ty.is_int() => {
+                                    all_str = false;
+                                    int_tys.push(ty);
+                                }
+                                Ty::F32 => {
+                                    all_str = false;
+                                    int_tys.push(Ty::F32);
+                                }
                                 _ => {
                                     return Err(self
                                         .err("console.log arguments must be numbers or strings"))
@@ -1347,8 +1552,14 @@ impl<'s> FnCompiler<'s> {
                                 self.err("console.log cannot mix strings and numbers in one call")
                             );
                         }
-                        for a in args {
-                            self.compile_expr(a, Some(Ty::Num))?;
+                        for (i, a) in args.iter().enumerate() {
+                            self.compile_expr(a, None)?;
+                            match int_tys.get(i) {
+                                Some(Ty::I32 | Ty::U32) => self.emit(Ins::F64ConvertI32S),
+                                Some(Ty::I64 | Ty::U64) => self.emit(Ins::F64ConvertI64S),
+                                Some(Ty::F32) => self.emit(Ins::F64PromoteF32),
+                                _ => {}
+                            }
                         }
                         self.emit(Ins::Call(args.len() as u32 - 1));
                         self.emit(Ins::F64Const(0.0.into()));

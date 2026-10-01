@@ -45,7 +45,11 @@
 //! TypeScript-style annotations (`number`, `string`, `boolean`, `any`,
 //! `T[]`) checked statically and erased at runtime — [`check_program`]
 //! returns every type error, and the WASM backend consumes the
-//! annotations as its valtypes.
+//! annotations as its valtypes. Layer three: Rust-style numeric types
+//! (`i8`-`i64`, `u8`-`u64`, `f32`) whose exact semantics — wrapping
+//! integer arithmetic, trapping division, `as` casts — materialize in
+//! the WASM dialect and erase to JS numbers in the dynamic engines,
+//! alongside JavaScript's bitwise and shift operators.
 //!
 //! And most code needs no annotations at all: [`infer`] classifies
 //! unannotated fresh-value declarations (own-able, or garbage-collected

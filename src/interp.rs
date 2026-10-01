@@ -365,6 +365,30 @@ impl<'o> Interp<'o> {
                 }
                 Ok(Value::Obj(Rc::new(RefCell::new(map))))
             }
+            Expr::Bit(op, l, r) => {
+                let lv = self.eval(env, l)?;
+                let rv = self.eval(env, r)?;
+                let (a, b) = (js_to_int32(&lv), js_to_int32(&rv));
+                let result: i32 = match op {
+                    BitOp::And => a & b,
+                    BitOp::Or => a | b,
+                    BitOp::Xor => a ^ b,
+                    BitOp::Shl => a.wrapping_shl(b as u32 & 31),
+                    BitOp::Shr => a.wrapping_shr(b as u32 & 31),
+                    // >>> is unsigned: convert through u32.
+                    BitOp::UShr => ((a as u32).wrapping_shr(b as u32 & 31)) as i32,
+                };
+                Ok(Value::Num(result as f64))
+            }
+            Expr::BitNot(e) => {
+                let v = self.eval(env, e)?;
+                Ok(Value::Num(!js_to_int32(&v) as f64))
+            }
+            Expr::AsCast(cast) => {
+                // Erased at runtime: the cast's conversions (truncation,
+                // wrapping) materialize only in the WASM dialect.
+                self.eval(env, &cast.expr)
+            }
             Expr::Unary(op, e) => {
                 let v = self.eval(env, e)?;
                 Ok(match op {
@@ -847,6 +871,19 @@ fn set_var(env: &Rc<Env>, name: &str, value: Value) {
         Some(parent) => set_var(parent, name, value),
         None => env.declare(name, value, false),
     }
+}
+
+/// JavaScript ToInt32: truncate toward zero, then wrap modulo 2^32.
+/// NaN, Infinity, and -Infinity map to 0.
+fn js_to_int32(v: &Value) -> i32 {
+    let n = match v {
+        Value::Num(n) => *n,
+        other => to_num(other),
+    };
+    if n.is_nan() || n.is_infinite() {
+        return 0;
+    }
+    (n.trunc() as i64) as i32
 }
 
 fn to_num(v: &Value) -> f64 {

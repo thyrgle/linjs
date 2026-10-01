@@ -389,6 +389,25 @@ impl<'o> Vm<'o> {
                 let v = self.stack.pop().unwrap();
                 self.stack.push(Value::Bool(!v.is_truthy()));
             }
+            Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr => {
+                let rv = self.stack.pop().unwrap();
+                let lv = self.stack.pop().unwrap();
+                let (a, b) = (js_to_int32(&lv), js_to_int32(&rv));
+                let result: i32 = match op {
+                    Op::BitAnd => a & b,
+                    Op::BitOr => a | b,
+                    Op::BitXor => a ^ b,
+                    Op::Shl => a.wrapping_shl(b as u32 & 31),
+                    Op::Shr => a.wrapping_shr(b as u32 & 31),
+                    Op::UShr => ((a as u32).wrapping_shr(b as u32 & 31)) as i32,
+                    _ => unreachable!(),
+                };
+                self.stack.push(Value::Num(result as f64));
+            }
+            Op::BitNot => {
+                let v = self.stack.pop().unwrap();
+                self.stack.push(Value::Num(!js_to_int32(&v) as f64));
+            }
             Op::Neg => {
                 let v = self.stack.pop().unwrap();
                 if matches!(v, Value::Own(_)) {
@@ -827,6 +846,18 @@ fn as_cell(v: &Value) -> Option<Rc<RefCell<Value>>> {
         Value::Cell(cell) => Some(cell.clone()),
         _ => None,
     }
+}
+
+/// JavaScript ToInt32: truncate toward zero, then wrap modulo 2^32.
+fn js_to_int32(v: &Value) -> i32 {
+    let n = match v {
+        Value::Num(n) => *n,
+        other => to_num(other),
+    };
+    if n.is_nan() || n.is_infinite() {
+        return 0;
+    }
+    (n.trunc() as i64) as i32
 }
 
 fn to_num(v: &Value) -> f64 {

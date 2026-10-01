@@ -39,7 +39,21 @@ impl Type {
 
     fn from_ann(ann: &TypeAnn) -> Type {
         match ann {
-            TypeAnn::Num => Type::Num,
+            // TS-style: every numeric annotation is the number family
+            // to the checker. The WASM dialect enforces the exact
+            // integer/float split.
+            TypeAnn::Num
+            | TypeAnn::I8
+            | TypeAnn::U8
+            | TypeAnn::I16
+            | TypeAnn::U16
+            | TypeAnn::I32
+            | TypeAnn::U32
+            | TypeAnn::I64
+            | TypeAnn::U64
+            | TypeAnn::F32
+            | TypeAnn::Usize
+            | TypeAnn::Isize => Type::Num,
             TypeAnn::Str => Type::Str,
             TypeAnn::Bool => Type::Bool,
             TypeAnn::Any => Type::Any,
@@ -362,6 +376,19 @@ impl<'s> Scope<'s> {
             Expr::Binary(_, l, r) => {
                 self.infer(l, errors);
                 self.infer(r, errors);
+                Type::Num
+            }
+            Expr::Bit(_, l, r) => {
+                self.infer(l, errors);
+                self.infer(r, errors);
+                Type::Num
+            }
+            Expr::AsCast(cast) => {
+                self.infer(&cast.expr, errors);
+                Type::from_ann(&cast.ann)
+            }
+            Expr::BitNot(e) => {
+                self.infer(e, errors);
                 Type::Num
             }
             Expr::Eq(..) => Type::Bool,
