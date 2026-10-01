@@ -372,17 +372,18 @@ impl<'o> Interp<'o> {
                 Ok(match op {
                     UnaryOp::Not => Value::Bool(!v.is_truthy()),
                     UnaryOp::Neg => Value::Num(-to_num(&v)),
-                    UnaryOp::Typeof => match v {
-                        Value::Num(_) => Value::Str("number".into()),
-                        Value::Str(_) => Value::Str("string".into()),
-                        Value::Bool(_) => Value::Str("boolean".into()),
-                        Value::Undefined => Value::Str("undefined".into()),
-                        Value::Null | Value::Arr(_) | Value::Obj(_) | Value::Own(_) => {
-                            Value::Str("object".into())
-                        }
-                        Value::Moved => Value::Str("undefined".into()),
-                        Value::Func(_) => Value::Str("function".into()),
-                    },
+                    UnaryOp::Typeof => {
+                        let name = match v {
+                            Value::Num(_) => "number",
+                            Value::Str(_) => "string",
+                            Value::Bool(_) => "boolean",
+                            Value::Undefined => "undefined",
+                            Value::Null | Value::Arr(_) | Value::Obj(_) | Value::Own(_) => "object",
+                            Value::Moved | Value::Iter(_) | Value::Cell(_) => "undefined",
+                            Value::Func(_) => "function",
+                        };
+                        Value::Str(Rc::from(name))
+                    }
                 })
             }
             Expr::Binary(op, l, r) => {
@@ -428,7 +429,7 @@ impl<'o> Interp<'o> {
             Expr::Index(obj, index) => {
                 let o = self.eval(env, obj)?;
                 let i = self.eval(env, index)?;
-                Ok(index_get(&self.arenas, &o, &i)?)
+                Ok(index_read(&self.arenas, &o, &i)?)
             }
             Expr::Member(obj, prop) => {
                 let o = self.eval(env, obj)?;
@@ -503,7 +504,7 @@ impl<'o> Interp<'o> {
             Target::Index(obj, idx) => {
                 let o = self.eval(env, obj)?;
                 let i = self.eval(env, idx)?;
-                Ok(index_get(&self.arenas, &o, &i)?)
+                Ok(index_read(&self.arenas, &o, &i)?)
             }
             Target::Member(obj, prop) => {
                 let o = self.eval(env, obj)?;
@@ -599,7 +600,7 @@ impl<'o> Interp<'o> {
                     ));
                 }
                 let i = self.eval(env, idx)?;
-                index_set(&self.arenas, &o, &i, value)?;
+                index_write(&self.arenas, &o, &i, value)?;
                 Ok(())
             }
             Target::Member(obj, prop) => {
@@ -733,6 +734,9 @@ impl<'o> Interp<'o> {
         };
         match &*func {
             Func::Native { f, .. } => f(&argv).map_err(|message| InterpError { message }),
+            Func::VmClosure { .. } => {
+                Err(bail("internal: bytecode function reached the tree-walker"))
+            }
             Func::Closure { env: def_env, .. } => {
                 crate::mem::push(&self.arenas);
                 let result = self.call_closure(&func, argv, def_env);
@@ -752,6 +756,9 @@ impl<'o> Interp<'o> {
     ) -> Result<Value, InterpError> {
         match &**func {
             Func::Native { f, .. } => f(&argv).map_err(|message| InterpError { message }),
+            Func::VmClosure { .. } => {
+                Err(bail("internal: bytecode function reached the tree-walker"))
+            }
             Func::Closure { params, body, .. } => {
                 let call_env = Env::function_scope(Some(def_env.clone()));
                 for (i, p) in params.iter().enumerate() {
@@ -849,7 +856,20 @@ fn to_num(v: &Value) -> f64 {
     }
 }
 
-fn binary(op: BinOp, lv: Value, rv: Value) -> Value {
+pub(crate) fn type_of(v: &Value) -> Value {
+    let name = match v {
+        Value::Num(_) => "number",
+        Value::Str(_) => "string",
+        Value::Bool(_) => "boolean",
+        Value::Undefined => "undefined",
+        Value::Null | Value::Arr(_) | Value::Obj(_) | Value::Own(_) => "object",
+        Value::Moved | Value::Iter(_) | Value::Cell(_) => "undefined",
+        Value::Func(_) => "function",
+    };
+    Value::Str(Rc::from(name))
+}
+
+pub(crate) fn binary(op: BinOp, lv: Value, rv: Value) -> Value {
     match op {
         BinOp::Add => {
             if matches!(lv, Value::Str(_)) || matches!(rv, Value::Str(_)) {
@@ -899,7 +919,7 @@ fn obj_key(index: &Value) -> Option<String> {
     }
 }
 
-fn index_get(
+pub(crate) fn index_read(
     arenas: &crate::mem::Arenas,
     obj: &Value,
     index: &Value,
@@ -970,7 +990,7 @@ fn index_get(
     })
 }
 
-fn index_set(
+pub(crate) fn index_write(
     arenas: &crate::mem::Arenas,
     obj: &Value,
     index: &Value,
@@ -1023,7 +1043,7 @@ fn index_set(
 }
 
 fn member_get(arenas: &crate::mem::Arenas, obj: &Value, prop: &str) -> Result<Value, InterpError> {
-    index_get(arenas, obj, &Value::Str(Rc::from(prop)))
+    index_read(arenas, obj, &Value::Str(Rc::from(prop)))
 }
 
 fn member_set(
@@ -1040,5 +1060,5 @@ fn member_set(
             return Ok(());
         }
     }
-    index_set(arenas, obj, &Value::Str(Rc::from(prop)), value)
+    index_write(arenas, obj, &Value::Str(Rc::from(prop)), value)
 }

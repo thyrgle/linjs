@@ -79,6 +79,19 @@ assert_eq!(String::from_utf8(out).unwrap(), "3\n");
 Requires Node for the differential tests; the suite skips them gracefully
 when Node is absent.
 
+## The bytecode VM
+
+memjs compiles to bytecode and runs on an explicit stack machine
+(`memjs::run_vm`) — the structural rehearsal for a WASM backend. Frames
+have slot-based locals resolved at compile time; locals captured by
+closures are boxed into shared cells (with per-iteration cells for
+`for (let ...)` matching JavaScript exactly); every call pushes a frame
+and its activation arena, and return pops both — `@own` teardown is
+structural, not simulated. The VM passes the whole test suite in
+lockstep with the tree-walking interpreter: identical outputs on every
+fixture, identical memory semantics, and byte-identical output against
+Node.
+
 ## Ownership inference
 
 Most code should need no annotations at all. `memjs::infer_report`
@@ -103,6 +116,8 @@ parameter fails loudly at runtime rather than silently diverging.
 
 M1 (language + interpreter + transpiler), M2 (objects, `var`, `for..in`,
 correct `for`-`let` closures), M3 (`@own`/`@ref` arenas with enforced
-moves and borrows), and M4 (ownership inference) are complete.
+moves and borrows), M4 (ownership inference), and M5 (the bytecode VM)
+are complete. Next: a WASM backend — the VM's frame and cell layout
+transliterates to linear memory.
 
 License: MIT OR Apache-2.0.

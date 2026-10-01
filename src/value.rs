@@ -24,6 +24,14 @@ pub enum Func {
         name: &'static str,
         f: Box<NativeFn>,
     },
+    /// A bytecode closure: proto plus captured cells. Top-level
+    /// functions are closures over the main frame, so this is the only
+    /// bytecode shape.
+    VmClosure {
+        name: Option<String>,
+        proto: Rc<crate::compile::FuncProto>,
+        cells: Vec<Rc<RefCell<Value>>>,
+    },
 }
 
 impl std::fmt::Debug for Func {
@@ -31,6 +39,7 @@ impl std::fmt::Debug for Func {
         match self {
             Func::Closure { name, .. } => write!(f, "Closure({name:?})"),
             Func::Native { name, .. } => write!(f, "Native({name})"),
+            Func::VmClosure { name, .. } => write!(f, "VmClosure({name:?})"),
         }
     }
 }
@@ -153,7 +162,20 @@ pub enum Value {
     /// The previous owner of a moved `@own` value. Reading it is a
     /// use-after-move error.
     Moved,
+    /// Internal iteration state for the bytecode VM's for-of/for-in.
+    /// Never observable from source programs.
+    Iter(Rc<RefCell<IterState>>),
+    /// Internal: a shared binding cell for a captured local. Never
+    /// observable from source programs.
+    Cell(Rc<RefCell<Value>>),
     Func(Rc<Func>),
+}
+
+/// Where an iterator is and what remains.
+#[derive(Debug, Clone)]
+pub struct IterState {
+    pub items: Vec<Value>,
+    pub pos: usize,
 }
 
 impl Value {
@@ -164,6 +186,7 @@ impl Value {
             Value::Num(n) => *n != 0.0 && !n.is_nan(),
             Value::Str(s) => !s.is_empty(),
             Value::Undefined | Value::Null | Value::Moved => false,
+            Value::Iter(_) | Value::Cell(_) => true,
             Value::Arr(_) | Value::Obj(_) | Value::Own(_) | Value::Func(_) => true,
         }
     }
@@ -266,6 +289,8 @@ impl Value {
             Value::Obj(_) => "[object Object]".into(),
             Value::Own(_) => "[own value]".into(),
             Value::Moved => "[moved]".into(),
+            Value::Cell(_) => "[cell]".into(),
+            Value::Iter(_) => "[iter]".into(),
             Value::Func(_) => "[function]".into(),
         }
     }
@@ -348,6 +373,12 @@ fn to_number(v: &Value) -> f64 {
         Value::Null => 0.0,
         Value::Undefined => f64::NAN,
         Value::Str(s) => s.trim().parse::<f64>().unwrap_or(f64::NAN),
-        Value::Arr(_) | Value::Obj(_) | Value::Own(_) | Value::Moved | Value::Func(_) => f64::NAN,
+        Value::Arr(_)
+        | Value::Obj(_)
+        | Value::Own(_)
+        | Value::Moved
+        | Value::Iter(_)
+        | Value::Cell(_)
+        | Value::Func(_) => f64::NAN,
     }
 }

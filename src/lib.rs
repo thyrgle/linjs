@@ -45,10 +45,17 @@
 //! with the reason), and [`run_inferred`] applies the verdicts — the
 //! Node differential verifies inferred programs byte for byte.
 //!
+//! For compilation, [`compile`] lowers the AST to bytecode and
+//! [`vm::Vm`] executes it on an explicit stack machine — slot-based
+//! frames, cell-boxed closures, and arena teardown as part of frame
+//! return. [`run_vm`] runs it, and the differential binds it to the
+//! interpreter and Node.
+//!
 //! Divergences from JavaScript are documented in [`interp`], [`mem`],
-//! and [`infer`].
+//! [`infer`], and [`compile`].
 
 pub mod ast;
+pub mod compile;
 pub mod infer;
 pub mod interp;
 pub mod lexer;
@@ -57,11 +64,14 @@ pub mod parser;
 pub mod passes;
 pub mod transpile;
 pub mod value;
+pub mod vm;
 
 pub use ast::{Expr, Stmt};
+pub use compile::{compile, Program};
 pub use interp::{Interp, InterpError, Item};
 pub use passes::{parse_program, program_from_tree, Ctx, ItemsPass, Settle};
 pub use transpile::transpile;
+pub use vm::Vm;
 
 /// Classifies the program's unannotated fresh-value declarations
 /// without running anything: `(name, verdict)` in declaration order.
@@ -106,6 +116,44 @@ pub fn check_inferred_against_node(source: &str) -> Result<(), String> {
     if ours != theirs {
         return Err(format!(
             "outputs diverge (inferred):\n-- memjs --\n{ours}\n-- node --\n{theirs}"
+        ));
+    }
+    Ok(())
+}
+
+/// Compiles `source` to bytecode and runs it on the stack VM.
+///
+/// The output matches [`run`] and Node byte for byte — the differential
+/// suite holds all three engines together.
+pub fn run_vm(
+    source: &str,
+    out: &mut dyn std::io::Write,
+) -> Result<Vec<(usize, String)>, InterpError> {
+    let (items, errors) = parse_program(source).map_err(|e| InterpError { message: e })?;
+    let mut vm = vm::Vm::new(out);
+    vm.run_items(&items)?;
+    Ok(errors)
+}
+
+/// Like [`check_against_node`], but the memjs side runs on the bytecode
+/// VM.
+pub fn check_vm_against_node(source: &str) -> Result<(), String> {
+    let node = which_node().ok_or("node not available")?;
+    let mut ours = Vec::new();
+    run_vm(source, &mut ours).map_err(|e| format!("memjs vm error: {}", e.message))?;
+    let ours = String::from_utf8(ours).map_err(|e| e.to_string())?;
+
+    let (items, _) = parse_program(source)?;
+    let js = transpile(&items);
+    let output = std::process::Command::new(node)
+        .arg("-e")
+        .arg(js)
+        .output()
+        .map_err(|e| format!("node failed to run: {e}"))?;
+    let theirs = String::from_utf8_lossy(&output.stdout).to_string();
+    if ours != theirs {
+        return Err(format!(
+            "outputs diverge (vm):\n-- memjs --\n{ours}\n-- node --\n{theirs}"
         ));
     }
     Ok(())
