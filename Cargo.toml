@@ -1,10 +1,10 @@
 [package]
-name = "memjs"
+name = "linjs"
 version = "0.1.0"
 edition = "2021"
 description = "A JavaScript-subset pilot on increparse: incremental parsing, closures, a tree-walking interpreter, and a JS transpiler — the proving ground for gradual memory semantics."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/thyrgle/memjs"
+repository = "https://github.com/thyrgle/linjs"
 readme = "README.md"
 
 [dependencies]

@@ -1,6 +1,6 @@
-//! memjs to JavaScript: prints the AST back out.
+//! linjs to JavaScript: prints the AST back out.
 //!
-//! memjs programs are a strict JavaScript subset, so transpilation is
+//! linjs programs are a strict JavaScript subset, so transpilation is
 //! mostly parenthesized printing. The output runs in Node — which is how
 //! the differential test checks the interpreter against the reference
 //! implementation.

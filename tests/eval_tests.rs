@@ -1,6 +1,6 @@
 //! End-to-end evaluation tests: programs run, output matches.
 
-use memjs::run;
+use linjs::run;
 
 fn eval(src: &str) -> String {
     let mut out = Vec::new();
@@ -371,7 +371,7 @@ fn for_in() {
 #[test]
 fn parse_diagnostics_are_reported() {
     let mut out = Vec::new();
-    let errors = memjs::run("let ok = 1; console.log(ok); let = 2;", &mut out).unwrap();
+    let errors = linjs::run("let ok = 1; console.log(ok); let = 2;", &mut out).unwrap();
     assert_eq!(errors.len(), 1, "one broken item");
     // The good items still ran.
     assert_eq!(String::from_utf8(out).unwrap(), "1\n");

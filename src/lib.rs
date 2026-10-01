@@ -1,4 +1,4 @@
-//! memjs — a JavaScript subset with incremental bones.
+//! linjs — a JavaScript subset with incremental bones.
 //!
 //! A pilot built on [`increparse`] to prove the compiler pattern: the
 //! engine segments a source file into top-level items and parses each
@@ -6,13 +6,13 @@
 //! as contexts; edits re-segment and re-parse only what changed
 //! (content-keyed caches keep untouched items pointer-identical); and a
 //! tree-walking interpreter executes the settled tree. A transpiler
-//! prints the same AST back to JavaScript so every memjs program can be
+//! prints the same AST back to JavaScript so every linjs program can be
 //! checked against Node.
 //!
 //! # Examples
 //!
 //! ```
-//! use memjs::run;
+//! use linjs::run;
 //!
 //! let mut out = Vec::new();
 //! run("console.log(1 + 2);", &mut out).unwrap();
@@ -100,13 +100,13 @@ pub fn run_inferred(
     Ok(errors)
 }
 
-/// Like [`check_against_node`], but the memjs side runs with ownership
+/// Like [`check_against_node`], but the linjs side runs with ownership
 /// inference applied — the soundness oracle: inferred programs must
 /// produce identical output to Node.
 pub fn check_inferred_against_node(source: &str) -> Result<(), String> {
     let node = which_node().ok_or("node not available")?;
     let mut ours = Vec::new();
-    run_inferred(source, &mut ours).map_err(|e| format!("memjs error: {}", e.message))?;
+    run_inferred(source, &mut ours).map_err(|e| format!("linjs error: {}", e.message))?;
     let ours = String::from_utf8(ours).map_err(|e| e.to_string())?;
 
     let (items, _) = parse_program(source)?;
@@ -119,7 +119,7 @@ pub fn check_inferred_against_node(source: &str) -> Result<(), String> {
     let theirs = String::from_utf8_lossy(&output.stdout).to_string();
     if ours != theirs {
         return Err(format!(
-            "outputs diverge (inferred):\n-- memjs --\n{ours}\n-- node --\n{theirs}"
+            "outputs diverge (inferred):\n-- linjs --\n{ours}\n-- node --\n{theirs}"
         ));
     }
     Ok(())
@@ -144,7 +144,7 @@ pub fn check_wasm_against_node(source: &str) -> Result<(), String> {
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
 
     let mut ours = Vec::new();
-    run(source, &mut ours).map_err(|e| format!("memjs error: {}", e.message))?;
+    run(source, &mut ours).map_err(|e| format!("linjs error: {}", e.message))?;
     let ours = String::from_utf8(ours).map_err(|e| e.to_string())?;
 
     let js = "const b = Buffer.from('".to_string()
@@ -172,7 +172,7 @@ pub fn check_wasm_against_node(source: &str) -> Result<(), String> {
     }
     if ours != theirs {
         return Err(format!(
-            "outputs diverge (wasm):\n-- memjs --\n{ours}\n-- wasm --\n{theirs}"
+            "outputs diverge (wasm):\n-- linjs --\n{ours}\n-- wasm --\n{theirs}"
         ));
     }
     Ok(())
@@ -192,12 +192,12 @@ pub fn run_vm(
     Ok(errors)
 }
 
-/// Like [`check_against_node`], but the memjs side runs on the bytecode
+/// Like [`check_against_node`], but the linjs side runs on the bytecode
 /// VM.
 pub fn check_vm_against_node(source: &str) -> Result<(), String> {
     let node = which_node().ok_or("node not available")?;
     let mut ours = Vec::new();
-    run_vm(source, &mut ours).map_err(|e| format!("memjs vm error: {}", e.message))?;
+    run_vm(source, &mut ours).map_err(|e| format!("linjs vm error: {}", e.message))?;
     let ours = String::from_utf8(ours).map_err(|e| e.to_string())?;
 
     let (items, _) = parse_program(source)?;
@@ -210,7 +210,7 @@ pub fn check_vm_against_node(source: &str) -> Result<(), String> {
     let theirs = String::from_utf8_lossy(&output.stdout).to_string();
     if ours != theirs {
         return Err(format!(
-            "outputs diverge (vm):\n-- memjs --\n{ours}\n-- node --\n{theirs}"
+            "outputs diverge (vm):\n-- linjs --\n{ours}\n-- node --\n{theirs}"
         ));
     }
     Ok(())
@@ -236,7 +236,7 @@ pub fn run(
 pub fn check_against_node(source: &str) -> Result<(), String> {
     let node = which_node().ok_or("node not available")?;
     let mut ours = Vec::new();
-    run(source, &mut ours).map_err(|e| format!("memjs error: {}", e.message))?;
+    run(source, &mut ours).map_err(|e| format!("linjs error: {}", e.message))?;
     let ours = String::from_utf8(ours).map_err(|e| e.to_string())?;
 
     let (items, _) = parse_program(source)?;
@@ -249,7 +249,7 @@ pub fn check_against_node(source: &str) -> Result<(), String> {
     let theirs = String::from_utf8_lossy(&output.stdout).to_string();
     if ours != theirs {
         return Err(format!(
-            "outputs diverge:\n-- memjs --\n{ours}\n-- node --\n{theirs}"
+            "outputs diverge:\n-- linjs --\n{ours}\n-- node --\n{theirs}"
         ));
     }
     Ok(())

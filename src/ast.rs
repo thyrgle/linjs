@@ -1,4 +1,4 @@
-//! The memjs abstract syntax tree.
+//! The linjs abstract syntax tree.
 //!
 //! Statements and expressions cover the M1 JavaScript subset: `let` /
 //! `const`, assignment, `if` / `else`, `while`, `for`, `for..of`,

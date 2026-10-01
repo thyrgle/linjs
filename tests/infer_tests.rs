@@ -2,8 +2,8 @@
 //! programs behave identically to their garbage-collected versions,
 //! and explicit annotations are never touched.
 
-use memjs::infer::{Inference, Reason, Verdict};
-use memjs::{infer_report, run, run_inferred};
+use linjs::infer::{Inference, Reason, Verdict};
+use linjs::{infer_report, run, run_inferred};
 
 fn verdicts(src: &str) -> Vec<(String, Verdict)> {
     let Inference { verdicts } = infer_report(src).unwrap();
@@ -140,15 +140,15 @@ fn inference_preserves_behavior() {
 fn inference_flips_qualifying_declarations_to_own() {
     // White-box: after apply, the AST carries Mem::Own exactly where
     // the verdicts said OwnAble.
-    use memjs::passes::parse_program;
+    use linjs::passes::parse_program;
 
     let src = "let a = [1, 2];\nlet b = a;\nconsole.log(b[0]);";
     let (mut items, _) = parse_program(src).unwrap();
-    memjs::infer::infer(&mut items, true);
+    linjs::infer::infer(&mut items, true);
     let modes: Vec<String> = items
         .iter()
         .filter_map(|item| match item {
-            memjs::Item::Stmt(memjs::Stmt::Let { decls, mem, .. }) => {
+            linjs::Item::Stmt(linjs::Stmt::Let { decls, mem, .. }) => {
                 Some(format!("{}:{mem:?}", decls[0].0))
             }
             _ => None,

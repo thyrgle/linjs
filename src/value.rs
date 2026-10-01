@@ -1,4 +1,4 @@
-//! memjs runtime values: JavaScript semantics in miniature.
+//! linjs runtime values: JavaScript semantics in miniature.
 //!
 //! Everything heap-shaped lives behind `Rc` — the "loose mode" of the
 //! gradual-memory story. The M3 `@own`/`@ref` annotations will route
@@ -225,12 +225,12 @@ impl Value {
     }
 
     /// `console.log` formatting for containers, matching Node's util
-    /// inspect for the values memjs can build: `[ 1, 'x' ]`,
+    /// inspect for the values linjs can build: `[ 1, 'x' ]`,
     /// `{ a: 1 }`, functions as `[Function: name]`. Strings inside
     /// containers are quoted (double quotes only when the string
     /// contains a single quote and no double quote). Object keys print
     /// bare when identifier-shaped, quoted otherwise. Matches Node for
-    /// the nesting depths memjs programs reach in practice; very deep
+    /// the nesting depths linjs programs reach in practice; very deep
     /// structures print fully instead of Node's `[Array]` truncation.
     pub fn inspect(&self) -> String {
         match self {

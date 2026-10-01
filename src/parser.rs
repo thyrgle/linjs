@@ -1,9 +1,9 @@
-//! The memjs parser: tokens to AST via precedence climbing.
+//! The linjs parser: tokens to AST via precedence climbing.
 //!
 //! All positions are absolute byte offsets into the source. Semicolons
 //! are required (a documented divergence from JavaScript's ASI). The
 //! parser is the only place that decides where top-level items end, so
-//! [`top_level_items`] drives memjs's regionization.
+//! [`top_level_items`] drives linjs's regionization.
 
 use crate::ast::*;
 use crate::lexer::{Comment, Tok, Token};

@@ -2,7 +2,7 @@
 //! interpreter everywhere (outputs identical), enforce the same memory
 //! semantics, and match Node byte for byte.
 
-use memjs::{run, run_vm};
+use linjs::{run, run_vm};
 
 fn both(src: &str) -> (String, String) {
     let mut tree_out = Vec::new();
@@ -112,8 +112,8 @@ fn vm_enforces_memory_semantics() {
 
     // Arenas drop with their frames.
     let mut interp_out = Vec::new();
-    let mut vm = memjs::vm::Vm::new(&mut interp_out);
-    let (items, _) = memjs::parse_program(
+    let mut vm = linjs::vm::Vm::new(&mut interp_out);
+    let (items, _) = linjs::parse_program(
         "function make() { // @own\n let x = [1, 2, 3]; return x.length; }\n\
          let s = 0;\n\
          for (let i = 0; i < 100; i++) { s += make(); }\n\
@@ -146,7 +146,7 @@ fn vm_matches_node() {
         return;
     }
     for (i, src) in PARITY_FIXTURES.iter().enumerate() {
-        match memjs::check_vm_against_node(src) {
+        match linjs::check_vm_against_node(src) {
             Ok(()) => {}
             Err(msg) if msg == "node not available" => {
                 eprintln!("skipping: node is not available");

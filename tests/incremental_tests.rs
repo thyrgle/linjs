@@ -3,8 +3,8 @@
 //! any edit sequence equals a cold parse of the same text.
 
 use increparse::{CancelToken, Engine, SerialExecutor, Session};
-use memjs::passes::{program_from_tree, Ctx, ItemsPass, Settle};
-use memjs::{transpile, Interp, Item};
+use linjs::passes::{program_from_tree, Ctx, ItemsPass, Settle};
+use linjs::{transpile, Interp, Item};
 
 fn make_engine() -> Engine<Ctx> {
     Engine::with((ItemsPass::new(), Settle))
@@ -19,7 +19,7 @@ fn eval_items(items: &[Item]) -> String {
 
 /// The `Arc` pointer of the function named `name`, read straight from
 /// the tree so pointer identity is observable.
-fn fn_ptr(tree: &increparse::ParseTree<Ctx>, name: &str) -> Option<*const memjs::ast::FnDef> {
+fn fn_ptr(tree: &increparse::ParseTree<Ctx>, name: &str) -> Option<*const linjs::ast::FnDef> {
     for id in tree.children(tree.root()) {
         if let Ctx::Fn(def) = tree.ctx(*id) {
             if def.name == name {
@@ -133,7 +133,7 @@ fn evaluation_matches_cold_after_edits() {
         assert!(errors.is_empty(), "no diagnostics after an edit");
         let incremental = eval_items(&items);
 
-        let (cold_items, _) = memjs::parse_program(&source).unwrap();
+        let (cold_items, _) = linjs::parse_program(&source).unwrap();
         let cold = eval_items(&cold_items);
 
         assert_eq!(incremental, cold, "diverged on:\n{source}");
@@ -145,7 +145,7 @@ fn evaluation_matches_cold_after_edits() {
 #[test]
 fn transpiled_programs_are_stable() {
     let src = "function f(n) { return n * 2; }\nconsole.log(f(3));\n";
-    let (items, _) = memjs::parse_program(src).unwrap();
+    let (items, _) = linjs::parse_program(src).unwrap();
     let js = transpile(&items);
     assert!(js.contains("function f(n)"));
     assert!(js.contains("console.log(f(3));"), "transpiled:\n{js}");

@@ -1,11 +1,11 @@
-//! The Node differential: every fixture program runs in the memjs
+//! The Node differential: every fixture program runs in the linjs
 //! interpreter and, transpiled, in Node — the outputs must match byte
 //! for byte. Skips gracefully where Node is unavailable.
 
-use memjs::check_against_node;
+use linjs::check_against_node;
 
 /// Fixture programs whose JavaScript semantics are unambiguous. The
-/// memjs interpreter and Node must agree on every line of output.
+/// linjs interpreter and Node must agree on every line of output.
 const FIXTURES: &[&str] = &[
     // arithmetic, precedence, numbers
     "console.log(1 + 2 * 3, (1 + 2) * 3, 7 % 3, 7 / 2, -4 + 1);",
@@ -73,7 +73,7 @@ const FIXTURES: &[&str] = &[
     r#"for (const k in 42) { console.log(k); } console.log("done");"#,
 ];
 
-/// Programs whose fresh locals qualify for inference — the memjs side
+/// Programs whose fresh locals qualify for inference — the linjs side
 /// runs with ownership applied, and must still match Node byte for
 /// byte. This is the inference soundness oracle.
 const INFERRED_FIXTURES: &[&str] = &[
@@ -97,7 +97,7 @@ fn inferred_interpreter_matches_node() {
         return;
     }
     for (i, src) in INFERRED_FIXTURES.iter().enumerate() {
-        match memjs::check_inferred_against_node(src) {
+        match linjs::check_inferred_against_node(src) {
             Ok(()) => {}
             Err(msg) if msg == "node not available" => {
                 eprintln!("skipping: node is not available");

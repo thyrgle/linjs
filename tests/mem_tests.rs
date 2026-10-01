@@ -2,7 +2,7 @@
 //! moves are enforced, `@ref` is a read-only borrow, and `@own` values
 //! cannot escape — while unannotated programs behave exactly as before.
 
-use memjs::run;
+use linjs::run;
 
 fn eval(src: &str) -> String {
     let mut out = Vec::new();
@@ -219,8 +219,8 @@ fn arguments_borrow_own_values() {
 fn arenas_are_dropped_with_their_activation() {
     // 100 calls push and pop 100 arenas; only the global one remains.
     let mut out = Vec::new();
-    let mut interp = memjs::Interp::new(&mut out);
-    let (items, _) = memjs::parse_program(
+    let mut interp = linjs::Interp::new(&mut out);
+    let (items, _) = linjs::parse_program(
         "function make() { // @own\n let x = [1, 2, 3]; return x.length; }\n\
          let s = 0;\n\
          for (let i = 0; i < 100; i++) { s += make(); }\n\
@@ -238,8 +238,8 @@ fn annotated_programs_stay_valid_javascript() {
     // annotated program is unchanged and runs in Node. (Byte-identity
     // with Node is asserted for these programs in node_diff_tests.)
     let src = "// @own\nlet buf = [1, 2];\n// @ref\nlet view = buf;\nconsole.log(view.length);\n";
-    let (items, _) = memjs::parse_program(src).unwrap();
-    let js = memjs::transpile(&items);
+    let (items, _) = linjs::parse_program(src).unwrap();
+    let js = linjs::transpile(&items);
     assert!(
         !js.contains("@own") && !js.contains("@ref"),
         "annotations must not leak into codegen:\n{js}"

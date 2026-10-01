@@ -1,4 +1,4 @@
-# memjs
+# linjs
 
 A JavaScript subset with **gradual memory semantics**, built on
 [increparse](https://github.com/thyrgle/increparse) — the proving ground for a
@@ -57,7 +57,7 @@ settled tree, and a transpiler prints the same AST back to JavaScript.
 
 ## Verified against Node
 
-memjs ships a transpiler, and the test suite runs fixture programs through
+linjs ships a transpiler, and the test suite runs fixture programs through
 both the interpreter and Node — the outputs must match byte for byte,
 including annotated programs (Node ignores the comments). Divergences from
 JavaScript are documented in the crate docs.
@@ -69,7 +69,7 @@ cargo test   # the test suite is the demo
 ```
 
 ```rust
-use memjs::run;
+use linjs::run;
 
 let mut out = Vec::new();
 run("console.log(1 + 2);", &mut out).unwrap();
@@ -81,8 +81,8 @@ when Node is absent.
 
 ## The bytecode VM
 
-memjs compiles to bytecode and runs on an explicit stack machine
-(`memjs::run_vm`) — the structural rehearsal for a WASM backend. Frames
+linjs compiles to bytecode and runs on an explicit stack machine
+(`linjs::run_vm`) — the structural rehearsal for a WASM backend. Frames
 have slot-based locals resolved at compile time; locals captured by
 closures are boxed into shared cells (with per-iteration cells for
 `for (let ...)` matching JavaScript exactly); every call pushes a frame
@@ -94,7 +94,7 @@ Node.
 
 ## The WASM backend
 
-`memjs::compile_to_wasm` compiles the **strict dialect** — numbers,
+`linjs::compile_to_wasm` compiles the **strict dialect** — numbers,
 booleans, control flow, functions, and `// @own` arrays — to a real
 WebAssembly module. `@own` arrays live in linear memory, bump-allocated
 from a per-frame arena; the escape rules guarantee frame teardown is a
@@ -106,18 +106,18 @@ against the interpreter byte for byte.
 
 ## Ownership inference
 
-Most code should need no annotations at all. `memjs::infer_report`
+Most code should need no annotations at all. `linjs::infer_report`
 classifies every unannotated fresh-value declaration:
 
 ```rust
-let report = memjs::infer_report(src).unwrap();
+let report = linjs::infer_report(src).unwrap();
 // [("buf", OwnAble), ("data", Gc(EscapesViaReturn)), ...]
 ```
 
 A declaration is own-able when no return escapes it, no container
 stores it, no closure captures it, no aliasing shares it — and it is
 not used in arithmetic, which JavaScript would coerce silently.
-`memjs::run_inferred` applies those verdicts before running: qualifying
+`linjs::run_inferred` applies those verdicts before running: qualifying
 declarations allocate into arenas, exactly as if they carried `// @own`.
 The Node differential covers inferred programs too — identical output to
 Node is the soundness oracle. The one documented v1 limit: ordinary

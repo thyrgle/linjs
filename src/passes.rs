@@ -1,4 +1,4 @@
-//! memjs on the engine: one pass segments the source into top-level
+//! linjs on the engine: one pass segments the source into top-level
 //! items and parses each item right where it stands.
 //!
 //! The parse results live in the tree as contexts — `Ctx::Fn(Arc<FnDef>)`
@@ -19,7 +19,7 @@ use crate::interp::Item;
 use crate::lexer::lex;
 use crate::parser::{self, TopItem};
 
-/// The per-node context of a memjs tree.
+/// The per-node context of a linjs tree.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Ctx {
     Root,

@@ -3,7 +3,7 @@
 //! unannotated heap values are rejected (there is no GC to fall back
 //! on).
 
-use memjs::{check_wasm_against_node, compile_to_wasm, run};
+use linjs::{check_wasm_against_node, compile_to_wasm, run};
 
 /// Numeric fixtures for the strict dialect.
 const WASM_FIXTURES: &[&str] = &[
@@ -58,7 +58,7 @@ fn wasm_module_has_the_exported_shape() {
         u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
         1
     );
-    memjs::wasm::validate(&bytes).unwrap();
+    linjs::wasm::validate(&bytes).unwrap();
 }
 
 #[test]

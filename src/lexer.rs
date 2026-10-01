@@ -1,4 +1,4 @@
-//! The memjs lexer: source text to tokens with absolute byte spans.
+//! The linjs lexer: source text to tokens with absolute byte spans.
 //!
 //! Comments (`//`, `/* */`) are skipped but their spans are recorded —
 //! the M3 memory annotations (`// @own`, `// @ref`) will be recovered
