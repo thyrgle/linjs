@@ -1588,7 +1588,7 @@ fn collect_nested_captures_target(target: &Target, out: &mut HashSet<String>) {
 
 /// Collects every identifier referenced anywhere in a statement,
 /// including inside nested closures.
-fn collect_all_refs(stmt: &Stmt, out: &mut HashSet<String>) {
+pub(crate) fn collect_all_refs(stmt: &Stmt, out: &mut HashSet<String>) {
     match stmt {
         Stmt::Let { decls, .. } | Stmt::Var { decls, .. } => {
             for d in decls {
@@ -1656,7 +1656,7 @@ fn collect_all_refs(stmt: &Stmt, out: &mut HashSet<String>) {
     }
 }
 
-fn collect_all_refs_expr(expr: &Expr, out: &mut HashSet<String>) {
+pub(crate) fn collect_all_refs_expr(expr: &Expr, out: &mut HashSet<String>) {
     match expr {
         Expr::Ident(name) => {
             out.insert(name.clone());

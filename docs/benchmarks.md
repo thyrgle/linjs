@@ -70,6 +70,28 @@ a trunc, and a branch per element access. That gap is compiler work
 (redundant-elimination passes we don't do yet), not a memory-model
 cost. The memory model shows up in E3 instead.
 
+## E6b — Bounds-check elimination + strength reduction (M10)
+
+Recognizing `for (let i = 0; i < a.length; i++)` as a sequential
+element loop (i not captured, not reassigned, a never reassigned)
+unlocks strength-reduced addressing: a running pointer local replaces
+the per-access `base + 8 + i*stride` computation, and `a[i]` reads
+lose their bounds check, trunc, and NaN else-path entirely. When the
+body never reads `i` outside `a[i]`, the induction variable is dropped
+and the loop runs purely on the address.
+
+| Kernel | before | after | V8 |
+|---|---|---|---|
+| array-sum | 1.02 ms | **0.59 ms** | 0.37 ms |
+| array-sum-i32 | 1.30 ms | **0.59 ms** | 0.36 ms |
+
+1.7× faster than the checked path, within 1.6× of V8 — and the
+remaining gap is the accumulator bookkeeping, not memory access.
+With i32[] the payload is half the linear memory of the f64 version.
+The checker-verified safety scans (no closure capture, no reassignment,
+no shadowing) mean elimination is only ever applied where reads are
+provably in bounds.
+
 ## E6 — Integer dialect (M9 follow-up)
 
 With Rust-style numeric types landed, two integer kernels join the

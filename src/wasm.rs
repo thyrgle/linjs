@@ -37,6 +37,7 @@ use wasm_encoder::{
 };
 
 use crate::ast::*;
+use crate::compile::{collect_all_refs, collect_all_refs_expr};
 use crate::interp::Item;
 
 /// Why the strict dialect rejected a program.
@@ -625,6 +626,18 @@ pub fn compile(source: &str) -> Result<Vec<u8>, WasmError> {
     Ok(bytes)
 }
 
+/// A recognized sequential element loop: `for (let i = 0; i < a.length;
+/// i++)`. The strength-reduced address local walks the elements, so
+/// body element accesses of the form `a[i]` need no bounds check and
+/// no per-access address arithmetic.
+#[derive(Clone)]
+struct ActiveSeq {
+    array_name: String,
+    index_name: String,
+    addr_slot: u32,
+    elem_i32: bool,
+}
+
 /// Compiles one function body.
 struct FnCompiler<'s> {
     /// name -> (local index, type)
@@ -643,7 +656,24 @@ struct FnCompiler<'s> {
     strings: &'s HashMap<String, usize>,
     /// Current label depth (blocks, loops, and ifs are labels).
     depth: u32,
+    /// The enclosing recognized sequential element loop: array local
+    /// slot, induction variable name, strength-reduced address local,
+    /// element stride. Element reads/writes of the form `a[i]` inside
+    /// the body take the direct (bounds-free) addressing path.
+    active_seq: Option<ActiveSeq>,
     signatures: &'s HashMap<String, (u32, usize)>,
+}
+
+/// The recognized sequential element loop.
+struct SeqLoop {
+    index_name: String,
+    array_name: String,
+    array_slot: u32,
+    stride: i32,
+    elem_i32: bool,
+    /// The body never reads the induction variable outside `a[i]`
+    /// positions: the loop can run on the address alone.
+    drop_index: bool,
 }
 
 impl<'s> FnCompiler<'s> {
@@ -672,6 +702,7 @@ impl<'s> FnCompiler<'s> {
             code: Vec::new(),
             loops: Vec::new(),
             depth: 0,
+            active_seq: None,
             alloc_idx,
             allocb_idx,
             concat_idx,
@@ -905,12 +936,190 @@ impl<'s> FnCompiler<'s> {
         }
     }
 
-    /// for (init; cond; step) body:
-    ///
-    /// block $exit { loop { init-part done above; cond→br_if $exit;
-    /// block $cont { body } step; br $top } }
-    ///
-    /// Inside the body: continue → br 0 ($cont), break → br 2 ($exit).
+    /// Recognizes `for (let i = 0; i < a.length; i++)` with `i` unread
+    /// and unmodified in the body and `a` a never-reassigned local
+    /// array. Anything else falls back to the checked path.
+    fn recognize_sequential(
+        &self,
+        init: &Option<Box<Stmt>>,
+        cond_expr: Option<&Expr>,
+        step_expr: Option<&Expr>,
+        body: &Stmt,
+    ) -> Option<SeqLoop> {
+        use crate::ast::Target;
+
+        // init: `let i = 0`
+        let (i_name, i_zero) = match init.as_deref() {
+            Some(Stmt::Let {
+                decls,
+                is_const: false,
+                mem: Mem::Gc,
+                ..
+            }) => match decls.first() {
+                Some(d) if decls.len() == 1 => {
+                    let zero = match &d.init {
+                        Some(Expr::Num(n)) => *n == 0.0,
+                        _ => false,
+                    };
+                    (&d.name, zero)
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if !i_zero {
+            return None;
+        }
+
+        // cond: `i < a.length`
+        let mut array_name: Option<String> = None;
+        if let Some(Expr::Binary(BinOp::Lt, l, r)) = cond_expr {
+            if let (Expr::Ident(li), Expr::Member(obj, prop)) = (&**l, &**r) {
+                if li == i_name && prop == "length" {
+                    if let Expr::Ident(an) = &**obj {
+                        array_name = Some(an.clone());
+                    }
+                }
+            }
+        }
+        let array_name = array_name?;
+
+        // step: `i++` / `++i` / `i += 1`
+        let inc_step = match step_expr {
+            Some(Expr::Update(UpdateOp::Inc, _, Target::Ident(n))) => n == i_name,
+            Some(Expr::Assign(target, value)) => {
+                let is_inc = matches!(target, Target::Ident(n2) if n2 == i_name)
+                    && matches!(
+                        value.as_ref(),
+                        Expr::Binary(
+                            BinOp::Add,
+                            l2,
+                            v
+                        ) if matches!(l2.as_ref(), Expr::Ident(l2n) if l2n == i_name)
+                            && matches!(v.as_ref(), Expr::Num(vn) if *vn == 1.0)
+                    );
+                is_inc
+            }
+            _ => false,
+        };
+        if !inc_step {
+            return None;
+        }
+
+        // The array must be a local with a known array type.
+        let (array_slot, elem_i32) = match self.locals.get(&array_name) {
+            Some((slot, Ty::Arr)) => (*slot, false),
+            Some((slot, Ty::ArrI32)) => (*slot, true),
+            _ => return None,
+        };
+
+        // Safety scans over the body: no assignment or update to `i` or
+        // the array, no redeclaration (shadowing), no closure capture.
+        if body_captures(body, i_name) || body_captures(body, &array_name) {
+            return None;
+        }
+        if body_binds_or_assigns(body, i_name) || body_binds_or_assigns(body, &array_name) {
+            return None;
+        }
+        if body_captures(body, i_name) || body_captures(body, &array_name) {
+            return None;
+        }
+
+        // Other uses of `i` in the body (beyond `a[i]` positions): if
+        // none, the induction variable can be dropped entirely.
+        let mut reads_i = false;
+        scan_reads_outside_index(body, i_name, &array_name, &mut reads_i);
+
+        Some(SeqLoop {
+            index_name: i_name.to_string(),
+            array_name,
+            array_slot,
+            stride: if elem_i32 { 4 } else { 8 },
+            elem_i32,
+            drop_index: !reads_i,
+        })
+    }
+
+    /// The optimized sequential element loop: strength-reduced address,
+    /// hoisted end, bounds-free element access.
+    fn compile_sequential(
+        &mut self,
+        init: &Option<Box<Stmt>>,
+        seq: SeqLoop,
+        body: &Stmt,
+    ) -> Result<(), WasmError> {
+        let stride = seq.stride;
+        let array_slot = seq.array_slot;
+
+        if !seq.drop_index {
+            let _ = self.fresh(ValType::I32); // reserve the index slot
+        }
+        let addr = self.fresh(ValType::I32);
+        let end = self.fresh(ValType::I32);
+
+        if let Some(init) = init {
+            self.compile_stmt(init)?;
+        }
+
+        // end = a + 8 + len * stride (hoisted: arrays are fixed length)
+        self.emit(Ins::LocalGet(array_slot));
+        self.emit(Ins::I32Load(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.emit(Ins::I32Const(stride));
+        self.emit(Ins::I32Mul);
+        self.emit(Ins::LocalGet(array_slot));
+        self.emit(Ins::I32Const(8));
+        self.emit(Ins::I32Add);
+        self.emit(Ins::I32Add);
+        self.emit(Ins::LocalSet(end));
+
+        // addr = a + 8
+        self.emit(Ins::LocalGet(array_slot));
+        self.emit(Ins::I32Const(8));
+        self.emit(Ins::I32Add);
+        self.emit(Ins::LocalSet(addr));
+
+        self.active_seq = Some(ActiveSeq {
+            array_name: seq.array_name.clone(),
+            index_name: seq.index_name.clone(),
+            addr_slot: addr,
+            elem_i32: seq.elem_i32,
+        });
+
+        let base = self.depth;
+        self.emit(Ins::Block(BlockType::Empty));
+        self.emit(Ins::Loop(BlockType::Empty));
+        self.depth += 2;
+        self.emit(Ins::Block(BlockType::Empty));
+        self.depth += 1;
+        self.loops.push((base, base + 2));
+        // exit when addr >= end (unsigned; both are memory offsets)
+        self.emit(Ins::LocalGet(addr));
+        self.emit(Ins::LocalGet(end));
+        self.emit(Ins::I32GeU);
+        self.emit(Ins::BrIf(2));
+
+        self.compile_stmt(body)?;
+        self.emit(Ins::End); // $cont
+
+        // addr += stride
+        self.emit(Ins::LocalGet(addr));
+        self.emit(Ins::I32Const(stride));
+        self.emit(Ins::I32Add);
+        self.emit(Ins::LocalSet(addr));
+
+        self.emit(Ins::Br(0)); // $top
+        self.depth -= 2;
+        self.emit(Ins::End); // loop
+        self.emit(Ins::End); // $exit block
+        self.loops.pop();
+        self.active_seq = None;
+        Ok(())
+    }
+
     fn compile_for(
         &mut self,
         init: &Option<Box<Stmt>>,
@@ -918,6 +1127,11 @@ impl<'s> FnCompiler<'s> {
         step: &Option<Expr>,
         body: &Stmt,
     ) -> Result<(), WasmError> {
+        let cond_ref = cond.as_ref();
+        let step_ref = step.as_ref();
+        if let Some(seq) = self.recognize_sequential(init, cond_ref, step_ref, body) {
+            return self.compile_sequential(init, seq, body);
+        }
         if let Some(init) = init {
             self.compile_stmt(init)?;
         }
@@ -1691,6 +1905,32 @@ impl<'s> FnCompiler<'s> {
                 Target::Member(..) => return Err(self.err("member assignment")),
             },
             Expr::Index(obj, idx) => {
+                // Fast path: inside a recognized sequential loop, a[i]
+                // with the loop's induction variable is known in bounds
+                // — direct load from the strength-reduced address.
+                if let (Expr::Ident(arr_name), Expr::Ident(ix)) = (&**obj, &**idx) {
+                    let seq = self.active_seq.clone();
+                    if let Some(seq) = seq {
+                        if seq.array_name == *arr_name && seq.index_name == *ix {
+                            self.emit(Ins::LocalGet(seq.addr_slot));
+                            if seq.elem_i32 {
+                                self.emit(Ins::I32Load(MemArg {
+                                    offset: 0,
+                                    align: 2,
+                                    memory_index: 0,
+                                }));
+                                self.emit(Ins::F64ConvertI32S);
+                            } else {
+                                self.emit(Ins::F64Load(MemArg {
+                                    offset: 0,
+                                    align: 3,
+                                    memory_index: 0,
+                                }));
+                            }
+                            return Ok(Ty::Num);
+                        }
+                    }
+                }
                 // Reads always yield f64 (JS-identical): f64 arrays load
                 // F64 directly; i32 arrays load I32 at the 4-byte stride
                 // and convert.
@@ -1997,4 +2237,366 @@ fn collect_str_literals(item: &Item, out: &mut Vec<String>) {
         }
         Item::Stmt(stmt) => walk_stmt(stmt, out),
     }
+}
+
+/// Whether the statement tree binds or assigns `name` anywhere (deep,
+/// excluding nested function bodies — those are captures).
+fn body_binds_or_assigns(stmt: &Stmt, name: &str) -> bool {
+    let mut found = false;
+    scan_binds_assigns(stmt, name, &mut found);
+    found
+}
+
+fn scan_binds_assigns(stmt: &Stmt, name: &str, found: &mut bool) {
+    if *found {
+        return;
+    }
+    match stmt {
+        Stmt::Let { decls, .. } | Stmt::Var { decls, .. } => {
+            for d in decls {
+                if d.name == name {
+                    *found = true;
+                }
+                if let Some(init) = &d.init {
+                    scan_binds_assigns_expr(init, name, found);
+                }
+            }
+        }
+        Stmt::Expr(expr) => scan_binds_assigns_expr(expr, name, found),
+        Stmt::If(cond, then, els) => {
+            scan_binds_assigns_expr(cond, name, found);
+            scan_binds_assigns(then, name, found);
+            if let Some(els) = els {
+                scan_binds_assigns(els, name, found);
+            }
+        }
+        Stmt::While(cond, body) => {
+            scan_binds_assigns_expr(cond, name, found);
+            scan_binds_assigns(body, name, found);
+        }
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            if let Some(init) = init {
+                scan_binds_assigns(init, name, found);
+            }
+            if let Some(cond) = cond {
+                scan_binds_assigns_expr(cond, name, found);
+            }
+            if let Some(step) = step {
+                scan_binds_assigns_expr(step, name, found);
+            }
+            scan_binds_assigns(body, name, found);
+        }
+        Stmt::ForOf { iterable, body, .. } | Stmt::ForIn { iterable, body, .. } => {
+            scan_binds_assigns_expr(iterable, name, found);
+            scan_binds_assigns(body, name, found);
+        }
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                scan_binds_assigns(s, name, found);
+            }
+        }
+        Stmt::Return(Some(expr)) => scan_binds_assigns_expr(expr, name, found),
+        _ => {}
+    }
+}
+
+fn scan_binds_assigns_expr(expr: &Expr, name: &str, found: &mut bool) {
+    match expr {
+        Expr::Assign(Target::Ident(n), value) if n == name => {
+            *found = true;
+            scan_binds_assigns_expr(value, name, found);
+        }
+        Expr::Assign(_, value) => scan_binds_assigns_expr(value, name, found),
+        Expr::Update(_, _, Target::Ident(n)) if n == name => {
+            *found = true;
+        }
+        Expr::Binary(_, l, r) | Expr::Logical(_, l, r) | Expr::Eq(_, l, r) => {
+            scan_binds_assigns_expr(l, name, found);
+            scan_binds_assigns_expr(r, name, found);
+        }
+        Expr::Array(items) => items
+            .iter()
+            .for_each(|e| scan_binds_assigns_expr(e, name, found)),
+        Expr::Obj(entries) => entries
+            .iter()
+            .for_each(|e| scan_binds_assigns_expr(&e.value, name, found)),
+        Expr::Unary(_, e) => scan_binds_assigns_expr(e, name, found),
+        Expr::Index(obj, idx) => {
+            scan_binds_assigns_expr(obj, name, found);
+            scan_binds_assigns_expr(idx, name, found);
+        }
+        Expr::Member(obj, _) => scan_binds_assigns_expr(obj, name, found),
+        Expr::Call(callee, args) => {
+            scan_binds_assigns_expr(callee, name, found);
+            args.iter()
+                .for_each(|a| scan_binds_assigns_expr(a, name, found));
+        }
+        Expr::Ternary(c, t, e) => {
+            scan_binds_assigns_expr(c, name, found);
+            scan_binds_assigns_expr(t, name, found);
+            scan_binds_assigns_expr(e, name, found);
+        }
+        _ => {}
+    }
+}
+
+/// Whether the body captures `name` — any nested function body
+/// referencing it (closures may outlive the frame and mutate through
+/// cells).
+fn body_captures(stmt: &Stmt, name: &str) -> bool {
+    let mut found = false;
+    walk_capture_stmt(stmt, name, &mut found);
+    found
+}
+
+fn walk_capture_stmt(stmt: &Stmt, name: &str, found: &mut bool) {
+    if *found {
+        return;
+    }
+    match stmt {
+        Stmt::Expr(expr) => walk_capture_expr(expr, name, found),
+        Stmt::Let { decls, .. } | Stmt::Var { decls, .. } => {
+            for d in decls {
+                if let Some(init) = &d.init {
+                    walk_capture_expr(init, name, found);
+                }
+            }
+        }
+        Stmt::If(cond, then, els) => {
+            walk_capture_expr(cond, name, found);
+            walk_capture_stmt(then, name, found);
+            if let Some(els) = els {
+                walk_capture_stmt(els, name, found);
+            }
+        }
+        Stmt::While(cond, body) => {
+            walk_capture_expr(cond, name, found);
+            walk_capture_stmt(body, name, found);
+        }
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            if let Some(init) = init {
+                walk_capture_stmt(init, name, found);
+            }
+            if let Some(cond) = cond {
+                walk_capture_expr(cond, name, found);
+            }
+            if let Some(step) = step {
+                walk_capture_expr(step, name, found);
+            }
+            walk_capture_stmt(body, name, found);
+        }
+        Stmt::ForOf { iterable, body, .. } | Stmt::ForIn { iterable, body, .. } => {
+            walk_capture_expr(iterable, name, found);
+            walk_capture_stmt(body, name, found);
+        }
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                walk_capture_stmt(s, name, found);
+            }
+        }
+        Stmt::Return(Some(expr)) => walk_capture_expr(expr, name, found),
+        _ => {}
+    }
+}
+
+fn walk_capture_expr(expr: &Expr, name: &str, found: &mut bool) {
+    match expr {
+        Expr::Arrow(params, body) => {
+            // References from inside the nested body that are not its
+            // own params/decls are captures.
+            let mut inner = std::collections::HashSet::new();
+            match &**body {
+                crate::ast::FnBody::Expr(e) => collect_all_refs_expr(e, &mut inner),
+                crate::ast::FnBody::Block(stmts) => {
+                    for s in stmts {
+                        collect_all_refs(s, &mut inner);
+                    }
+                }
+            }
+            for p in params {
+                inner.remove(p);
+            }
+            if inner.contains(name) {
+                *found = true;
+            }
+        }
+        Expr::Fn(_, params, stmts) => {
+            let mut inner = std::collections::HashSet::new();
+            for s in stmts {
+                collect_all_refs(s, &mut inner);
+            }
+            for p in params {
+                inner.remove(p);
+            }
+            if inner.contains(name) {
+                *found = true;
+            }
+        }
+        Expr::Array(items) => items.iter().for_each(|e| walk_capture_expr(e, name, found)),
+        Expr::Obj(entries) => entries
+            .iter()
+            .for_each(|e| walk_capture_expr(&e.value, name, found)),
+        Expr::Unary(_, e) => walk_capture_expr(e, name, found),
+        Expr::Binary(_, l, r) | Expr::Logical(_, l, r) | Expr::Eq(_, l, r) => {
+            walk_capture_expr(l, name, found);
+            walk_capture_expr(r, name, found);
+        }
+        Expr::Assign(target, value) => {
+            walk_capture_target(target, name, found);
+            walk_capture_expr(value, name, found);
+        }
+        Expr::Index(obj, idx) => {
+            walk_capture_expr(obj, name, found);
+            walk_capture_expr(idx, name, found);
+        }
+        Expr::Member(obj, _) => walk_capture_expr(obj, name, found),
+        Expr::Call(callee, args) => {
+            walk_capture_expr(callee, name, found);
+            args.iter().for_each(|a| walk_capture_expr(a, name, found));
+        }
+        Expr::Ternary(c, t, e) => {
+            walk_capture_expr(c, name, found);
+            walk_capture_expr(t, name, found);
+            walk_capture_expr(e, name, found);
+        }
+        Expr::Update(_, _, target) => walk_capture_target(target, name, found),
+        _ => {}
+    }
+}
+
+fn walk_capture_target(target: &crate::ast::Target, name: &str, found: &mut bool) {
+    match target {
+        crate::ast::Target::Ident(_) => {}
+        crate::ast::Target::Index(obj, idx) => {
+            walk_capture_expr(obj, name, found);
+            walk_capture_expr(idx, name, found);
+        }
+        crate::ast::Target::Member(obj, _) => walk_capture_expr(obj, name, found),
+    }
+}
+
+/// Whether the body reads `index` anywhere except as the index operand
+/// of `array[index]` — those positions vanish under strength-reduced
+/// addressing, everything else keeps the induction variable alive.
+fn scan_reads_outside_index(stmt: &Stmt, index: &str, array: &str, reads: &mut bool) {
+    fn expr_reads(expr: &Expr, index: &str, array: &str, reads: &mut bool) {
+        // `array[index]` positions are the vanishing uses.
+        if let Expr::Index(obj, idx) = expr {
+            if matches!(&**obj, Expr::Ident(n) if n == array)
+                && matches!(&**idx, Expr::Ident(n) if n == index)
+            {
+                return;
+            }
+        }
+        match expr {
+            Expr::Ident(n) if n == index => *reads = true,
+            Expr::Array(items) => items
+                .iter()
+                .for_each(|e| expr_reads(e, index, array, reads)),
+            Expr::Obj(entries) => entries
+                .iter()
+                .for_each(|e| expr_reads(&e.value, index, array, reads)),
+            Expr::Unary(_, e) => expr_reads(e, index, array, reads),
+            Expr::Binary(_, l, r) | Expr::Logical(_, l, r) | Expr::Eq(_, l, r) => {
+                expr_reads(l, index, array, reads);
+                expr_reads(r, index, array, reads);
+            }
+            Expr::Assign(target, value) => {
+                walk_target_reads(target, index, array, reads);
+                expr_reads(value, index, array, reads);
+            }
+            Expr::Index(obj, idx) => {
+                expr_reads(obj, index, array, reads);
+                expr_reads(idx, index, array, reads);
+            }
+            Expr::Member(obj, _) => expr_reads(obj, index, array, reads),
+            Expr::Call(callee, args) => {
+                expr_reads(callee, index, array, reads);
+                args.iter().for_each(|a| expr_reads(a, index, array, reads));
+            }
+            Expr::Ternary(c, t, e) => {
+                expr_reads(c, index, array, reads);
+                expr_reads(t, index, array, reads);
+                expr_reads(e, index, array, reads);
+            }
+            Expr::Update(_, _, target) => walk_target_reads(target, index, array, reads),
+            _ => {}
+        }
+    }
+
+    fn walk_target_reads(target: &crate::ast::Target, index: &str, array: &str, reads: &mut bool) {
+        match target {
+            crate::ast::Target::Ident(n) if n == index => *reads = true,
+            crate::ast::Target::Index(obj, idx) => {
+                expr_reads(obj, index, array, reads);
+                expr_reads(idx, index, array, reads);
+            }
+            crate::ast::Target::Member(obj, _) => expr_reads(obj, index, array, reads),
+            _ => {}
+        }
+    }
+
+    match stmt {
+        Stmt::Let { decls, .. } | Stmt::Var { decls, .. } => {
+            for d in decls {
+                if let Some(init) = &d.init {
+                    expr_reads(init, index, array, reads);
+                }
+            }
+        }
+        Stmt::Expr(expr) => expr_reads(expr, index, array, reads),
+        Stmt::If(cond, then, els) => {
+            expr_reads(cond, index, array, reads);
+            stmt_reads(then, index, array, reads);
+            if let Some(els) = els {
+                stmt_reads(els, index, array, reads);
+            }
+        }
+        Stmt::While(cond, body) => {
+            expr_reads(cond, index, array, reads);
+            stmt_reads(body, index, array, reads);
+        }
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            if let Some(init) = init {
+                stmt_reads(init, index, array, reads);
+            }
+            if let Some(cond) = cond {
+                expr_reads(cond, index, array, reads);
+            }
+            if let Some(step) = step {
+                expr_reads(step, index, array, reads);
+            }
+            stmt_reads(body, index, array, reads);
+        }
+        Stmt::ForOf { iterable, body, .. } | Stmt::ForIn { iterable, body, .. } => {
+            expr_reads(iterable, index, array, reads);
+            stmt_reads(body, index, array, reads);
+        }
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                stmt_reads(s, index, array, reads);
+            }
+        }
+        Stmt::Return(Some(expr)) => expr_reads(expr, index, array, reads),
+        _ => {}
+    }
+}
+
+fn stmt_reads(stmt: &Stmt, index: &str, array: &str, reads: &mut bool) {
+    scan_reads_outside_index(stmt, index, array, reads);
 }
