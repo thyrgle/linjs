@@ -661,7 +661,18 @@ struct FnCompiler<'s> {
     /// element stride. Element reads/writes of the form `a[i]` inside
     /// the body take the direct (bounds-free) addressing path.
     active_seq: Option<ActiveSeq>,
+    /// Set while emitting a scalar fallback: nested fors never re-enter
+    /// SIMD recognition.
+    simd_bail: bool,
     signatures: &'s HashMap<String, (u32, usize)>,
+}
+
+/// A recognized SIMD-transformable element loop: `c[i] = f(a[i], b[i],
+/// literals)` — a pure arithmetic tree over f64 element reads of local
+/// arrays and numeric literals. Target array first.
+#[derive(Clone)]
+struct SimdPlan {
+    arrays: Vec<(String, u32)>,
 }
 
 /// The recognized sequential element loop.
@@ -703,6 +714,7 @@ impl<'s> FnCompiler<'s> {
             loops: Vec::new(),
             depth: 0,
             active_seq: None,
+            simd_bail: false,
             alloc_idx,
             allocb_idx,
             concat_idx,
@@ -1120,6 +1132,317 @@ impl<'s> FnCompiler<'s> {
         Ok(())
     }
 
+    /// Recognizes a SIMD-transformable element loop:
+    /// `for (let i = 0; i < out.length; i++) out[i] = <pure expr>`
+    /// where the expression is + - * / arithmetic over element reads of
+    /// local f64 arrays and numeric literals. Every referenced array
+    /// must be a local `@own` f64 array, never reassigned, uncaptured.
+    fn recognize_simd(
+        &self,
+        init: &Option<Box<Stmt>>,
+        cond: &Option<Expr>,
+        step: &Option<Expr>,
+        body: &Stmt,
+    ) -> Option<SimdPlan> {
+        use crate::ast::Target;
+
+        // init: `let i = 0` (untyped)
+        match init.as_deref() {
+            Some(Stmt::Let {
+                decls,
+                is_const: false,
+                mem: Mem::Gc,
+                ..
+            }) => match decls.first() {
+                Some(d) if decls.len() == 1 => {
+                    if !matches!(&d.init, Some(Expr::Num(n)) if *n == 0.0) {
+                        return None;
+                    }
+                    if d.ann.is_some() {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+
+        // cond: `i < x.length` — the bound must be a plain array member
+        match cond {
+            Some(Expr::Binary(BinOp::Lt, l, r)) => {
+                let mut found: Option<String> = None;
+                if let Expr::Ident(li) = &**l {
+                    if li == "i" {
+                        if let Expr::Member(obj, prop) = &**r {
+                            if prop == "length" {
+                                if let Expr::Ident(an) = &**obj {
+                                    found = Some(an.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                found.as_ref()?;
+            }
+            _ => return None,
+        }
+
+        // step: `i++`
+        if !matches!(step, Some(Expr::Update(UpdateOp::Inc, _, Target::Ident(n))) if n == "i") {
+            return None;
+        }
+
+        // body: a single `out[i] = rhs` (bare or in a one-statement
+        // block — the parser wraps braced bodies).
+        let inner: &Stmt = match body {
+            Stmt::Block(stmts) if stmts.len() == 1 => &stmts[0],
+            other => other,
+        };
+        let (out_name, rhs) = match inner {
+            Stmt::Expr(Expr::Assign(Target::Index(obj, idx), value)) => {
+                let out_ok = matches!(&**obj, Expr::Ident(_));
+                let idx_ok = matches!(&**idx, Expr::Ident(inn) if inn == "i");
+                if !out_ok || !idx_ok {
+                    return None;
+                }
+                let on = match &**obj {
+                    Expr::Ident(on) => on.clone(),
+                    _ => unreachable!(),
+                };
+                let rhs = match value.as_ref() {
+                    rhs @ Expr::Num(_)
+                    | rhs @ Expr::Binary(BinOp::Add, _, _)
+                    | rhs @ Expr::Binary(BinOp::Sub, _, _)
+                    | rhs @ Expr::Binary(BinOp::Mul, _, _)
+                    | rhs @ Expr::Binary(BinOp::Div, _, _) => rhs.clone(),
+                    _ => return None,
+                };
+                (on, rhs)
+            }
+            _ => return None,
+        };
+
+        // No nested closures anywhere in the transform.
+        if expr_has_nested_fn(&rhs) {
+            return None;
+        }
+
+        // RHS must be a pure elementwise tree: Num literals, element
+        // reads `x[i]`, and + - * /. Calls, strings, objects, other
+        // identifiers — rejected. Sources are collected in read order.
+        let mut sources: Vec<String> = Vec::new();
+        if !simd_pure(&rhs, "i", &out_name, &mut sources) {
+            return None;
+        }
+
+        // Resolve slots: target + sources, all local f64 arrays.
+        let mut arrays: Vec<(String, u32)> = Vec::new();
+        for name in std::iter::once(&out_name).chain(sources.iter()) {
+            match self.locals.get(name) {
+                Some((slot, Ty::Arr)) => arrays.push((name.clone(), *slot)),
+                _ => return None,
+            }
+        }
+        // Target first, distinct only.
+        if arrays.is_empty() || arrays[0].0 != out_name {
+            return None;
+        }
+        for i in 0..arrays.len() {
+            for j in i + 1..arrays.len() {
+                if arrays[i].0 == arrays[j].0 {
+                    return None;
+                }
+            }
+        }
+
+        Some(SimdPlan { arrays })
+    }
+
+    /// Emits the SIMD transform: a length-equality guard, a vector loop
+    /// over element pairs, and a scalar remainder — with the scalar
+    /// generic loop as the fallback for mismatched lengths.
+    fn compile_simd(
+        &mut self,
+        init: &Option<Box<Stmt>>,
+        cond: &Option<Expr>,
+        step: &Option<Expr>,
+        body: &Stmt,
+        plan: &SimdPlan,
+    ) -> Result<(), WasmError> {
+        // Lengths, addrs, end — one local pair per array.
+        let n = plan.arrays.len();
+        let mut len_locals = Vec::new();
+        let mut addr_locals = Vec::new();
+        for _ in 0..n {
+            len_locals.push(self.fresh(ValType::I32));
+            addr_locals.push(self.fresh(ValType::I32));
+        }
+        let end_local = self.fresh(ValType::I32);
+        // Tail index as f64: the generic body paths read `i` as a
+        // number and truncate for addressing.
+        let ii = self.fresh(ValType::F64);
+
+        // la = I32Load(slot); addr = slot + 8 (elements start after
+        // the length header).
+        for (k, (_, slot)) in plan.arrays.iter().enumerate() {
+            self.emit(Ins::LocalGet(*slot));
+            self.emit(Ins::I32Load(MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+            self.emit(Ins::LocalSet(len_locals[k]));
+            self.emit(Ins::LocalGet(*slot));
+            self.emit(Ins::I32Const(8));
+            self.emit(Ins::I32Add);
+            self.emit(Ins::LocalSet(addr_locals[k]));
+        }
+        // End address: addr0 + (len & !1) * 8 — the vector loop runs
+        // the running target address against this fixed bound.
+        self.emit(Ins::LocalGet(addr_locals[0]));
+        self.emit(Ins::LocalGet(len_locals[0]));
+        self.emit(Ins::I32Const(-2));
+        self.emit(Ins::I32And);
+        self.emit(Ins::I32Const(8));
+        self.emit(Ins::I32Mul);
+        self.emit(Ins::I32Add);
+        self.emit(Ins::LocalSet(end_local));
+
+        // All-lengths-equal flag folded on the stack; a lone target
+        // needs no guard.
+        if n == 1 {
+            self.emit(Ins::I32Const(1));
+        } else {
+            self.emit(Ins::LocalGet(len_locals[0]));
+            self.emit(Ins::LocalGet(len_locals[1]));
+            self.emit(Ins::I32Eq);
+            for k in 2..n {
+                self.emit(Ins::LocalGet(len_locals[0]));
+                self.emit(Ins::LocalGet(len_locals[k]));
+                self.emit(Ins::I32Eq);
+                self.emit(Ins::I32And);
+            }
+        }
+
+        // Equal → vector loop plus odd tail; mismatched → the
+        // JS-identical generic loop for the full range.
+        self.emit(Ins::If(BlockType::Empty));
+        self.depth += 1;
+
+        self.emit(Ins::Block(BlockType::Empty)); // $vexit
+        self.emit(Ins::Loop(BlockType::Empty)); // $vtop
+        self.depth += 2;
+        self.emit(Ins::LocalGet(addr_locals[0]));
+        self.emit(Ins::LocalGet(end_local));
+        self.emit(Ins::I32GeU);
+        self.emit(Ins::BrIf(1)); // $vexit
+
+        // Store: the target is arrays[0] — the address goes down
+        // first, then the computed lanes ([addr, value] for stores).
+        self.emit(Ins::LocalGet(addr_locals[0]));
+        let rhs = simd_rhs(body);
+        self.compile_vexpr(rhs, plan, &addr_locals)?;
+        self.emit(Ins::V128Store(MemArg {
+            offset: 0,
+            align: 3,
+            memory_index: 0,
+        }));
+
+        // Advance all addrs by one v128 (two f64 lanes).
+        for a in &addr_locals {
+            self.emit(Ins::LocalGet(*a));
+            self.emit(Ins::I32Const(16));
+            self.emit(Ins::I32Add);
+            self.emit(Ins::LocalSet(*a));
+        }
+        self.emit(Ins::Br(0)); // $vtop
+        self.depth -= 2;
+        self.emit(Ins::End); // loop
+        self.emit(Ins::End); // block
+
+        // Odd tail: one element, the original body compiled with the
+        // checked generic paths (JS-identical), `i` bound to len - 1.
+        let prev_i = self.locals.insert("i".to_string(), (ii, Ty::Num));
+        self.emit(Ins::LocalGet(len_locals[0]));
+        self.emit(Ins::I32Const(1));
+        self.emit(Ins::I32And);
+        self.emit(Ins::If(BlockType::Empty));
+        self.depth += 1;
+        self.emit(Ins::LocalGet(len_locals[0]));
+        self.emit(Ins::I32Const(1));
+        self.emit(Ins::I32Sub);
+        self.emit(Ins::F64ConvertI32U);
+        self.emit(Ins::LocalSet(ii));
+        self.compile_stmt(body)?;
+        self.depth -= 1;
+        self.emit(Ins::End);
+        match prev_i {
+            Some(prev) => {
+                self.locals.insert("i".to_string(), prev);
+            }
+            None => {
+                self.locals.remove("i");
+            }
+        }
+
+        self.emit(Ins::Else);
+        self.compile_generic_for(init, cond.as_ref(), step.as_ref(), body)?;
+        self.depth -= 1;
+        self.emit(Ins::End);
+        Ok(())
+    }
+
+    /// Compiles the vector-lane form of the transform's RHS. The shape
+    /// was validated at recognition; only v128-clean nodes reach here.
+    fn compile_vexpr(
+        &mut self,
+        expr: &Expr,
+        plan: &SimdPlan,
+        addr_locals: &[u32],
+    ) -> Result<(), WasmError> {
+        match expr {
+            Expr::Num(n) => {
+                // Splat the literal into both lanes.
+                let mut bits = [0u8; 16];
+                let b = n.to_bits().to_le_bytes();
+                bits[..8].copy_from_slice(&b);
+                bits[8..16].copy_from_slice(&b);
+                self.emit(Ins::V128Const(i128::from_le_bytes(bits)));
+            }
+            Expr::Index(obj, _) => {
+                // Source element pair: v128.load from its addr local.
+                let an = match &**obj {
+                    Expr::Ident(an) => an,
+                    _ => return Err(self.err("bad source")),
+                };
+                let k = plan
+                    .arrays
+                    .iter()
+                    .position(|(name, _)| name == an)
+                    .expect("validated");
+                self.emit(Ins::LocalGet(addr_locals[k]));
+                self.emit(Ins::V128Load(MemArg {
+                    offset: 0,
+                    align: 3,
+                    memory_index: 0,
+                }));
+            }
+            Expr::Binary(op, l, r) => {
+                self.compile_vexpr(l, plan, addr_locals)?;
+                self.compile_vexpr(r, plan, addr_locals)?;
+                self.emit(match op {
+                    BinOp::Add => Ins::F64x2Add,
+                    BinOp::Sub => Ins::F64x2Sub,
+                    BinOp::Mul => Ins::F64x2Mul,
+                    BinOp::Div => Ins::F64x2Div,
+                    _ => return Err(self.err("unsupported vector op")),
+                });
+            }
+            _ => return Err(self.err("unsupported vector expression")),
+        }
+        Ok(())
+    }
+
     fn compile_for(
         &mut self,
         init: &Option<Box<Stmt>>,
@@ -1129,7 +1452,25 @@ impl<'s> FnCompiler<'s> {
     ) -> Result<(), WasmError> {
         let cond_ref = cond.as_ref();
         let step_ref = step.as_ref();
-        if let Some(seq) = self.recognize_sequential(init, cond_ref, step_ref, body) {
+        if !self.simd_bail {
+            if let Some(plan) = self.recognize_simd(init, cond, step, body) {
+                return self.compile_simd(init, cond, step, body, &plan);
+            }
+        }
+        self.compile_generic_for(init, cond_ref, step_ref, body)
+    }
+
+    /// The non-SIMD for loop: BCE sequential form when recognized,
+    /// else the fully checked generic loop. Also the SIMD fallback for
+    /// mismatched lengths.
+    fn compile_generic_for(
+        &mut self,
+        init: &Option<Box<Stmt>>,
+        cond: Option<&Expr>,
+        step: Option<&Expr>,
+        body: &Stmt,
+    ) -> Result<(), WasmError> {
+        if let Some(seq) = self.recognize_sequential(init, cond, step, body) {
             return self.compile_sequential(init, seq, body);
         }
         if let Some(init) = init {
@@ -2239,6 +2580,19 @@ fn collect_str_literals(item: &Item, out: &mut Vec<String>) {
     }
 }
 
+/// The transform's RHS expression, extracted from the body statement
+/// (shape validated at recognition).
+fn simd_rhs(body: &Stmt) -> &Expr {
+    let inner: &Stmt = match body {
+        Stmt::Block(stmts) if stmts.len() == 1 => &stmts[0],
+        other => other,
+    };
+    match inner {
+        Stmt::Expr(Expr::Assign(_, value)) => value,
+        _ => unreachable!("simd body shape"),
+    }
+}
+
 /// Whether the statement tree binds or assigns `name` anywhere (deep,
 /// excluding nested function bodies — those are captures).
 fn body_binds_or_assigns(stmt: &Stmt, name: &str) -> bool {
@@ -2599,4 +2953,68 @@ fn scan_reads_outside_index(stmt: &Stmt, index: &str, array: &str, reads: &mut b
 
 fn stmt_reads(stmt: &Stmt, index: &str, array: &str, reads: &mut bool) {
     scan_reads_outside_index(stmt, index, array, reads);
+}
+
+/// Whether an expression contains a nested arrow or function
+/// expression — SIMD transforms must be closure-free.
+fn expr_has_nested_fn(expr: &Expr) -> bool {
+    match expr {
+        Expr::Arrow(..) | Expr::Fn(..) => true,
+        Expr::Array(items) => items.iter().any(expr_has_nested_fn),
+        Expr::Obj(entries) => entries.iter().any(|e| expr_has_nested_fn(&e.value)),
+        Expr::Unary(_, e) => expr_has_nested_fn(e),
+        Expr::BitNot(e) => expr_has_nested_fn(e),
+        Expr::Binary(_, l, r) | Expr::Logical(_, l, r) | Expr::Eq(_, l, r) => {
+            expr_has_nested_fn(l) || expr_has_nested_fn(r)
+        }
+        Expr::Assign(target, value) => {
+            let t = match target {
+                Target::Ident(_) => false,
+                Target::Index(obj, idx) => expr_has_nested_fn(obj) || expr_has_nested_fn(idx),
+                Target::Member(obj, _) => expr_has_nested_fn(obj),
+            };
+            t || expr_has_nested_fn(value)
+        }
+        Expr::Index(obj, idx) => expr_has_nested_fn(obj) || expr_has_nested_fn(idx),
+        Expr::Member(obj, _) => expr_has_nested_fn(obj),
+        Expr::Call(callee, args) => {
+            expr_has_nested_fn(callee) || args.iter().any(expr_has_nested_fn)
+        }
+        Expr::Ternary(c, t, e) => {
+            expr_has_nested_fn(c) || expr_has_nested_fn(t) || expr_has_nested_fn(e)
+        }
+        Expr::Update(_, _, target) => match target {
+            Target::Ident(_) => false,
+            Target::Index(obj, idx) => expr_has_nested_fn(obj) || expr_has_nested_fn(idx),
+            Target::Member(obj, _) => expr_has_nested_fn(obj),
+        },
+        _ => false,
+    }
+}
+
+/// SIMD purity: `expr` is arithmetic (+ - * /) over numeric literals and
+/// element reads `x[i]` where x is one of the recognized arrays.
+/// Everything else (calls, closures, other identifiers) rejects.
+fn simd_pure(expr: &Expr, index: &str, target: &str, sources: &mut Vec<String>) -> bool {
+    match expr {
+        Expr::Num(_) => true,
+        Expr::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, l, r) => {
+            simd_pure(l, index, target, sources) && simd_pure(r, index, target, sources)
+        }
+        Expr::Index(obj, idx) => {
+            // Element read `x[i]`: the array must be an identifier and
+            // the index the induction variable.
+            matches!(&**obj, Expr::Ident(_)) && matches!(&**idx, Expr::Ident(n) if n == index) && {
+                if let Expr::Ident(an) = &**obj {
+                    if an != target && !sources.contains(an) {
+                        sources.push(an.clone());
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+        _ => false,
+    }
 }

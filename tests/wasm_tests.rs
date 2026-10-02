@@ -37,7 +37,50 @@ const WASM_FIXTURES: &[&str] = &[
 let a = [1, 2];
 console.log("sum incoming");
 console.log(a[0] + a[1]);"#,
+    // SIMD elementwise transforms: even length (pure vector pairs)
+    r#"// @own
+let a = [1, 2, 3, 4];
+// @own
+let b = [10, 20, 30, 40];
+// @own
+let out = [0, 0, 0, 0];
+for (let i = 0; i < a.length; i++) { out[i] = a[i] + b[i]; }
+console.log(out[0], out[1], out[2], out[3]);"#,
+    // SIMD odd length: vector pairs plus the scalar tail element
+    r#"// @own
+let a = [1, 2, 3, 4, 5];
+// @own
+let b = [2, 4, 6, 8, 10];
+// @own
+let out = [0, 0, 0, 0, 0];
+for (let i = 0; i < a.length; i++) { out[i] = a[i] * b[i] - 2 + a[i] / b[i]; }
+console.log(out[0], out[1], out[2], out[3], out[4]);"#,
+    // SIMD with a repeated source read and a literal splat
+    r#"// @own
+let a = [3, 7, 11];
+// @own
+let out = [0, 0, 0];
+for (let i = 0; i < a.length; i++) { out[i] = a[i] * a[i] + 1; }
+console.log(out[0], out[1], out[2]);"#,
 ];
+
+/// The SIMD transform fixture used by both the vector-op proof and
+/// the differential check.
+const SIMD_SRC: &str = "// @own\nlet a = [1, 2, 3, 4];\n// @own\nlet b = [10, 20, 30, 40];\n// @own\nlet out = [0, 0, 0, 0];\nfor (let i = 0; i < a.length; i++) { out[i] = a[i] + b[i]; }\nconsole.log(out[0], out[1], out[2], out[3]);";
+
+#[test]
+fn simd_path_emits_vector_ops() {
+    let module = compile_to_wasm(SIMD_SRC).expect("compiles");
+    // 0xFD prefix + LEB 0xF0 0x01 = f64x2.add; 0xFD 0x00 = v128.load.
+    assert!(
+        module.windows(3).any(|w| w == [0xFD, 0xF0, 0x01]),
+        "no f64x2.add in the module — the SIMD path did not fire"
+    );
+    assert!(
+        module.windows(2).any(|w| w == [0xFD, 0x00]),
+        "no v128.load in the module — the SIMD path did not fire"
+    );
+}
 
 #[test]
 fn wasm_matches_the_interpreter() {
