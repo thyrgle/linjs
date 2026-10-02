@@ -62,11 +62,55 @@ let a = [3, 7, 11];
 let out = [0, 0, 0];
 for (let i = 0; i < a.length; i++) { out[i] = a[i] * a[i] + 1; }
 console.log(out[0], out[1], out[2]);"#,
+    // SIMD i32[] lanes: even length (pure quads)
+    r#"// @own
+let xs: i32[] = [1, 2, 3, 4, 5, 6, 7, 8];
+// @own
+let ys: i32[] = [10, 20, 30, 40, 50, 60, 70, 80];
+// @own
+let out: i32[] = [0, 0, 0, 0, 0, 0, 0, 0];
+for (let i = 0; i < xs.length; i++) { out[i] = xs[i] + ys[i]; }
+console.log(out[0], out[1], out[2], out[3]);
+console.log(out[4], out[5], out[6], out[7]);"#,
+    // SIMD i32[] lanes: remainder elements after the quads (6 = 1 quad + 2)
+    r#"// @own
+let xs: i32[] = [1, 2, 3, 4, 5, 6];
+// @own
+let out: i32[] = [0, 0, 0, 0, 0, 0];
+for (let i = 0; i < xs.length; i++) { out[i] = xs[i] * 3; }
+console.log(out[0], out[1], out[2]);
+console.log(out[3], out[4], out[5]);"#,
+    // i32[] division: no integer SIMD opcode — the checked loop runs
+    // and models JS per-element division (exact halves here)
+    r#"// @own
+let xs: i32[] = [-8, 4, -6, 10];
+// @own
+let out: i32[] = [0, 0, 0, 0];
+for (let i = 0; i < xs.length; i++) { out[i] = xs[i] / 2; }
+console.log(out[0], out[1], out[2], out[3]);"#,
+    // BCE loop where the body reads `i` outside a[i]: the induction
+    // variable must step (regression: stale index in compile_sequential)
+    r#"// @own
+let a = [1, 2, 3, 4];
+let t = 0;
+for (let i = 0; i < a.length; i++) { t += a[i] * i; }
+console.log(t);"#,
 ];
 
 /// The SIMD transform fixture used by both the vector-op proof and
 /// the differential check.
 const SIMD_SRC: &str = "// @own\nlet a = [1, 2, 3, 4];\n// @own\nlet b = [10, 20, 30, 40];\n// @own\nlet out = [0, 0, 0, 0];\nfor (let i = 0; i < a.length; i++) { out[i] = a[i] + b[i]; }\nconsole.log(out[0], out[1], out[2], out[3]);";
+
+#[test]
+fn simd_path_emits_i32_vector_ops() {
+    let src = "// @own\nlet xs: i32[] = [1, 2, 3, 4];\n// @own\nlet ys: i32[] = [10, 20, 30, 40];\n// @own\nlet out: i32[] = [0, 0, 0, 0];\nfor (let i = 0; i < xs.length; i++) { out[i] = xs[i] + ys[i]; }\nconsole.log(out[0], out[1], out[2], out[3]);";
+    let module = compile_to_wasm(src).expect("compiles");
+    // 0xFD + LEB 0xAE 0x01 = i32x4.add.
+    assert!(
+        module.windows(3).any(|w| w == [0xFD, 0xAE, 0x01]),
+        "no i32x4.add in the module — the i32 SIMD path did not fire"
+    );
+}
 
 #[test]
 fn simd_path_emits_vector_ops() {

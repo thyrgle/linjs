@@ -673,6 +673,9 @@ struct FnCompiler<'s> {
 #[derive(Clone)]
 struct SimdPlan {
     arrays: Vec<(String, u32)>,
+    /// Plan-wide element type: all arrays are f64[] or all i32[].
+    /// Mixed transforms fall back to the checked loop.
+    elem_i32: bool,
 }
 
 /// The recognized sequential element loop.
@@ -1123,6 +1126,19 @@ impl<'s> FnCompiler<'s> {
         self.emit(Ins::I32Add);
         self.emit(Ins::LocalSet(addr));
 
+        // When the induction variable survives, step it too: the body
+        // reads `i` outside the recognized array's element positions
+        // (store indices, arithmetic) and must see 0, 1, 2, ...
+        if !seq.drop_index {
+            if let Some((idx_slot, _)) = self.locals.get(&seq.index_name) {
+                let slot = *idx_slot;
+                self.emit(Ins::LocalGet(slot));
+                self.emit(Ins::F64Const((1.0).into()));
+                self.emit(Ins::F64Add);
+                self.emit(Ins::LocalSet(slot));
+            }
+        }
+
         self.emit(Ins::Br(0)); // $top
         self.depth -= 2;
         self.emit(Ins::End); // loop
@@ -1235,13 +1251,21 @@ impl<'s> FnCompiler<'s> {
             return None;
         }
 
-        // Resolve slots: target + sources, all local f64 arrays.
+        // Resolve slots: target + sources, all local arrays of ONE
+        // element type (f64[] or i32[]) — mixed shapes fall back to
+        // the checked loop, which converts/truncates per element.
         let mut arrays: Vec<(String, u32)> = Vec::new();
+        let mut elem_i32: Option<bool> = None;
         for name in std::iter::once(&out_name).chain(sources.iter()) {
-            match self.locals.get(name) {
-                Some((slot, Ty::Arr)) => arrays.push((name.clone(), *slot)),
+            let (slot, is_i32) = match self.locals.get(name) {
+                Some((slot, ty @ (Ty::Arr | Ty::ArrI32))) => (*slot, *ty == Ty::ArrI32),
                 _ => return None,
+            };
+            if elem_i32.is_some() && elem_i32 != Some(is_i32) {
+                return None;
             }
+            elem_i32 = Some(is_i32);
+            arrays.push((name.clone(), slot));
         }
         // Target first, distinct only.
         if arrays.is_empty() || arrays[0].0 != out_name {
@@ -1254,8 +1278,20 @@ impl<'s> FnCompiler<'s> {
                 }
             }
         }
+        let elem_i32 = elem_i32.unwrap_or(false);
 
-        Some(SimdPlan { arrays })
+        // i32 lanes have no division opcode: / shapes stay on the
+        // checked path, which models JS trunc-toward-zero per element.
+        if elem_i32 && rhs_has_div(&rhs) {
+            return None;
+        }
+        // Lane literals must be exact i32 (the checked path would
+        // coerce/trap per element; the splat needs one value).
+        if elem_i32 && !simd_i32_literals(&rhs) {
+            return None;
+        }
+
+        Some(SimdPlan { arrays, elem_i32 })
     }
 
     /// Emits the SIMD transform: a length-equality guard, a vector loop
@@ -1297,13 +1333,17 @@ impl<'s> FnCompiler<'s> {
             self.emit(Ins::I32Add);
             self.emit(Ins::LocalSet(addr_locals[k]));
         }
-        // End address: addr0 + (len & !1) * 8 — the vector loop runs
-        // the running target address against this fixed bound.
+        // End address: addr0 + (len & !mask) * elem_size — the vector
+        // loop runs the running target address against this fixed
+        // bound. f64 pairs mask 1 lane at 8 bytes; i32 quads mask 3
+        // at 4 bytes.
+        let tail_mask: i32 = if plan.elem_i32 { -4 } else { -2 };
+        let elem_size: i32 = if plan.elem_i32 { 4 } else { 8 };
         self.emit(Ins::LocalGet(addr_locals[0]));
         self.emit(Ins::LocalGet(len_locals[0]));
-        self.emit(Ins::I32Const(-2));
+        self.emit(Ins::I32Const(tail_mask));
         self.emit(Ins::I32And);
-        self.emit(Ins::I32Const(8));
+        self.emit(Ins::I32Const(elem_size));
         self.emit(Ins::I32Mul);
         self.emit(Ins::I32Add);
         self.emit(Ins::LocalSet(end_local));
@@ -1360,22 +1400,35 @@ impl<'s> FnCompiler<'s> {
         self.emit(Ins::End); // loop
         self.emit(Ins::End); // block
 
-        // Odd tail: one element, the original body compiled with the
-        // checked generic paths (JS-identical), `i` bound to len - 1.
+        // Scalar remainder: up to mask elements the vector loop did
+        // not cover, the original body compiled with the checked
+        // generic paths (JS-identical), `i` bound per iteration.
+        let rem_elems = if plan.elem_i32 { 3 } else { 1 };
+        let cnt = self.fresh(ValType::I32);
         let prev_i = self.locals.insert("i".to_string(), (ii, Ty::Num));
         self.emit(Ins::LocalGet(len_locals[0]));
-        self.emit(Ins::I32Const(1));
+        self.emit(Ins::I32Const(!rem_elems));
         self.emit(Ins::I32And);
-        self.emit(Ins::If(BlockType::Empty));
-        self.depth += 1;
+        self.emit(Ins::LocalSet(cnt));
+        self.emit(Ins::Block(BlockType::Empty)); // $rexit
+        self.emit(Ins::Loop(BlockType::Empty)); // $rtop
+        self.depth += 2;
+        self.emit(Ins::LocalGet(cnt));
         self.emit(Ins::LocalGet(len_locals[0]));
-        self.emit(Ins::I32Const(1));
-        self.emit(Ins::I32Sub);
+        self.emit(Ins::I32GeU);
+        self.emit(Ins::BrIf(1)); // $rexit
+        self.emit(Ins::LocalGet(cnt));
         self.emit(Ins::F64ConvertI32U);
         self.emit(Ins::LocalSet(ii));
         self.compile_stmt(body)?;
-        self.depth -= 1;
-        self.emit(Ins::End);
+        self.emit(Ins::LocalGet(cnt));
+        self.emit(Ins::I32Const(1));
+        self.emit(Ins::I32Add);
+        self.emit(Ins::LocalSet(cnt));
+        self.emit(Ins::Br(0)); // $rtop
+        self.depth -= 2;
+        self.emit(Ins::End); // loop
+        self.emit(Ins::End); // block
         match prev_i {
             Some(prev) => {
                 self.locals.insert("i".to_string(), prev);
@@ -1402,11 +1455,18 @@ impl<'s> FnCompiler<'s> {
     ) -> Result<(), WasmError> {
         match expr {
             Expr::Num(n) => {
-                // Splat the literal into both lanes.
+                // Splat the literal across the lanes (2 f64 or 4 i32).
                 let mut bits = [0u8; 16];
-                let b = n.to_bits().to_le_bytes();
-                bits[..8].copy_from_slice(&b);
-                bits[8..16].copy_from_slice(&b);
+                if plan.elem_i32 {
+                    let b = (*n as i32).to_le_bytes();
+                    for k in 0..4 {
+                        bits[k * 4..k * 4 + 4].copy_from_slice(&b);
+                    }
+                } else {
+                    let b = n.to_bits().to_le_bytes();
+                    bits[..8].copy_from_slice(&b);
+                    bits[8..16].copy_from_slice(&b);
+                }
                 self.emit(Ins::V128Const(i128::from_le_bytes(bits)));
             }
             Expr::Index(obj, _) => {
@@ -1430,11 +1490,18 @@ impl<'s> FnCompiler<'s> {
             Expr::Binary(op, l, r) => {
                 self.compile_vexpr(l, plan, addr_locals)?;
                 self.compile_vexpr(r, plan, addr_locals)?;
-                self.emit(match op {
-                    BinOp::Add => Ins::F64x2Add,
-                    BinOp::Sub => Ins::F64x2Sub,
-                    BinOp::Mul => Ins::F64x2Mul,
-                    BinOp::Div => Ins::F64x2Div,
+                self.emit(match (plan.elem_i32, op) {
+                    (false, BinOp::Add) => Ins::F64x2Add,
+                    (false, BinOp::Sub) => Ins::F64x2Sub,
+                    (false, BinOp::Mul) => Ins::F64x2Mul,
+                    (false, BinOp::Div) => Ins::F64x2Div,
+                    // i32 lanes: wrapping add/sub/mul, bit-identical
+                    // to the checked paths for in-range arithmetic.
+                    (true, BinOp::Add) => Ins::I32x4Add,
+                    (true, BinOp::Sub) => Ins::I32x4Sub,
+                    (true, BinOp::Mul) => Ins::I32x4Mul,
+                    // Division is rejected at recognition.
+                    (true, BinOp::Div) => return Err(self.err("integer vector division")),
                     _ => return Err(self.err("unsupported vector op")),
                 });
             }
@@ -1788,6 +1855,20 @@ impl<'s> FnCompiler<'s> {
                     {
                         let v = match expr {
                             Expr::Num(n) => (*n as i64) as i32,
+                            _ => unreachable!(),
+                        };
+                        self.emit(Ins::I32Const(v));
+                        return Ok(expect);
+                    }
+                    // A negated integral literal folds to one constant
+                    // (the parser does not fold unary minus).
+                    (Ty::Num, Ty::I32) | (Ty::Num, Ty::U32) if matches!(expr, Expr::Unary(UnaryOp::Neg, e) if matches!(&**e, Expr::Num(n) if n.fract() == 0.0 && *n <= 2147483648.0)) =>
+                    {
+                        let v = match expr {
+                            Expr::Unary(UnaryOp::Neg, e) => match &**e {
+                                Expr::Num(n) => -((*n as i64) as i32),
+                                _ => unreachable!(),
+                            },
                             _ => unreachable!(),
                         };
                         self.emit(Ins::I32Const(v));
@@ -2988,6 +3069,27 @@ fn expr_has_nested_fn(expr: &Expr) -> bool {
             Target::Index(obj, idx) => expr_has_nested_fn(obj) || expr_has_nested_fn(idx),
             Target::Member(obj, _) => expr_has_nested_fn(obj),
         },
+        _ => false,
+    }
+}
+
+/// Whether the transform's RHS contains a division — i32 lanes have
+/// no division opcode, so those plans fall back to the checked loop.
+fn rhs_has_div(expr: &Expr) -> bool {
+    match expr {
+        Expr::Binary(BinOp::Div, _, _) => true,
+        Expr::Binary(_, l, r) => rhs_has_div(l) || rhs_has_div(r),
+        _ => false,
+    }
+}
+
+/// Whether every numeric literal in the RHS is an exact i32 — the
+/// lane splat needs one representable value.
+fn simd_i32_literals(expr: &Expr) -> bool {
+    match expr {
+        Expr::Num(n) => n.fract() == 0.0 && *n >= -2147483648.0 && *n <= 2147483647.0,
+        Expr::Binary(_, l, r) => simd_i32_literals(l) && simd_i32_literals(r),
+        Expr::Index(..) => true,
         _ => false,
     }
 }

@@ -126,6 +126,13 @@ no NaN checks.
 | Kernel | linjs WASM | V8 (JS) | ratio |
 |---|---|---|---|
 | vector-add (f64 elementwise, 40 elems × 20k) | 0.21 ms | 0.80 ms | **0.3×** |
+| vector-add-i32 (i32[] lanes, same shape) | 0.29 ms | 0.78 ms | **0.4×** |
+
+`i32[]` transforms run four lanes per v128 (`i32x4` add/sub/mul, no
+integer division — those shapes stay on the checked loop). Lane
+arithmetic is wrapping i32, bit-identical to the checked paths for
+in-range values; division and out-of-range literals fall back to the
+checked loop, which keeps the per-element JS semantics.
 
 Post-M10-phase-A refresh of the numeric kernels (current medians):
 
