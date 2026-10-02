@@ -1,0 +1,17 @@
+[package]
+name = "linjs-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "WebAssembly bindings for linjs: check, run, transpile, and compile-to-WASM inside the browser."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/thyrgle/linjs"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+linjs = { path = ".." }
+wasm-bindgen = "0.2"
+
+[package.metadata.wasm-pack]
+# `wasm-pack build --target web` from this directory produces pkg/.

@@ -79,6 +79,40 @@ assert_eq!(String::from_utf8(out).unwrap(), "3\n");
 Requires Node for the differential tests; the suite skips them gracefully
 when Node is absent.
 
+## The CLI
+
+```sh
+cargo build --release
+./target/release/linjs check program.js          # parse + type diagnostics
+./target/release/linjs check --strict program.js # also gate the WASM dialect
+./target/release/linjs run program.js            # the interpreter
+./target/release/linjs build program.js          # program.wasm, validated
+```
+
+`check` renders parse errors with line:col and type errors with the
+annotated subject, and exits 1 when anything is wrong — the editor
+and CI entry point. Types are TS-style: checked statically, erased at
+runtime.
+
+## In the browser
+
+The `wasm/` directory builds the whole compiler into a WebAssembly
+module: `check`, `run`, `transpile`, and `compile` — diagnostics and a
+runnable `.wasm` module, both client-side.
+
+```sh
+cd wasm
+cargo build --release --target wasm32-unknown-unknown
+wasm-bindgen --target web --out-dir pkg \
+  target/wasm32-unknown-unknown/release/linjs_wasm.wasm
+python3 -m http.server 8000   # open http://localhost:8000/demo/
+```
+
+`node wasm/bindings_test.mjs` proves it end to end under Node: the
+bindings produce the same diagnostics as the CLI, and a module compiled
+in-wasm runs in the host's own WebAssembly runtime with
+checksum-identical output.
+
 ## Benchmarks
 
 The three engines are measured against V8 and Boa with a
@@ -175,9 +209,13 @@ parameter fails loudly at runtime rather than silently diverging.
 
 M1 (language + interpreter + transpiler), M2 (objects, `var`, `for..in`,
 correct `for`-`let` closures), M3 (`@own`/`@ref` arenas with enforced
-moves and borrows), M4 (ownership inference), M5 (the bytecode VM), and
-M6 (the WASM backend for the strict dialect) are complete. Next:
-widening the strict dialect (object layouts, strings, methods) toward
-full-language WASM compilation.
+moves and borrows), M4 (ownership inference), M5 (the bytecode VM), M6
+(the WASM backend for the strict dialect), M7 (strings in linear
+memory), M8 (the TS-style type layer), M9 (Rust-style numeric types
+with `as` casts and bitwise operators), and M10 (bounds-check
+elimination, strength reduction, and f64x2/i32x4 SIMD elementwise
+codegen) are complete. The `linjs` CLI and the `linjs-wasm` browser
+build ship alongside. Next: widening the strict dialect (object
+layouts, methods) toward full-language WASM compilation.
 
 License: MIT OR Apache-2.0.

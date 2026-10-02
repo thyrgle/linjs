@@ -1,3 +1,6 @@
 /target
 Cargo.lock
 /bench/out
+/wasm/pkg
+/wasm/pkg-node
+/wasm/target
