@@ -12,6 +12,7 @@ const KERNELS: &[&str] = &[
     "loop-arith",
     "array-sum",
     "array-sum-i32",
+    "vector-add",
     "bit-arith",
     "string-build",
     "calls",

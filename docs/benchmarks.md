@@ -113,6 +113,37 @@ Checksums verified against the interpreter and Node before timing.
 Integer division and casts trap in the dialect (documented
 divergences); the kernels avoid div-by-zero.
 
+## E7 — SIMD elementwise transforms (M10 phase B)
+
+Sequential elementwise stores (`out[i] = a[i] + b[i]` shapes) compile
+to a length-guarded `f64x2` vector loop: two lanes per iteration, one
+`v128` load per source, one `v128` store, an odd-tail scalar element,
+and a fall back to the JS-identical checked loop when lengths diverge.
+On the `vector-add` kernel the compiled module runs **3.4× faster than
+V8** — the loop body is four instructions per pair, no bounds checks,
+no NaN checks.
+
+| Kernel | linjs WASM | V8 (JS) | ratio |
+|---|---|---|---|
+| vector-add (f64 elementwise, 40 elems × 20k) | 0.21 ms | 0.80 ms | **0.3×** |
+
+Post-M10-phase-A refresh of the numeric kernels (current medians):
+
+| Kernel | linjs WASM | V8 (JS) | ratio |
+|---|---|---|---|
+| fib | 0.81 ms | 3.63 ms | **0.2×** |
+| array-sum (BCE, strength-reduced) | 0.59 ms | 0.83 ms | **0.7×** |
+| array-sum-i32 | 0.63 ms | 0.40 ms | 1.6× |
+| bit-arith | 0.42 ms | 0.37 ms | 1.1× |
+| calls | 0.17 ms | 0.12 ms | 1.4× |
+| loop-arith | 0.80 ms | 0.67 ms | 1.2× |
+
+Bounds-check elimination + strength reduction flipped `array-sum` from
+2.9× behind V8 to **faster than V8 (0.7×)**; SIMD elementwise flips the
+store-shaped kernels to 3.4× ahead. The remaining behind-V8 kernels are
+the known compiler taxes: reduction with i32 element reads
+(`array-sum-i32` still truncates per read) and string/call-heavy shapes.
+
 ## E3 — Allocation latency (the differentiator)
 
 One allocation cycle per call, 100,000 calls, per-call sampling:
